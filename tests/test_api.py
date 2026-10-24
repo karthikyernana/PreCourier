@@ -433,6 +433,23 @@ def test_a_reply_arriving_after_release_does_not_move_the_order_backwards():
     assert revisions[-1]["source"] == "buyer_confirmed"
 
 
+def test_resolve_cannot_invent_a_buyer_reply_for_an_unprocessed_order():
+    """Resolution is only valid for a hold (or an already released advisory order)."""
+    h = Harness(mode=Mode.GATEWAY, decider=states.NullDecider())
+    order_id = h.post_order().json()["order_id"]
+    # The null decider releases immediately, so create a fresh order without
+    # processing it to exercise the service boundary directly through HTTP.
+    raw = OrderRepo(h.tenant).create(
+        buyer_id=OrderRepo(h.tenant).get(order_id).buyer_id,
+        value_paise=120_000, address=states.Address(line1="Flat 1"),
+        mode=Mode.GATEWAY)
+    response = h.client.post(
+        "/v1/orders/%s/resolve" % raw.id,
+        json={"resolution": "address_confirmed"}, headers=h.headers)
+    assert response.status_code == 422
+    assert "hold" in response.json()["detail"]
+
+
 # ==========================================================================
 # 3. an internal exception releases the order
 # ==========================================================================

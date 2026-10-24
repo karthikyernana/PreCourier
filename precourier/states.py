@@ -701,6 +701,12 @@ class OrderService:
                 return self._settled(order, reason="already %s"
                                                    % order.state.value)
 
+            if order.state not in HOLDING_STATES \
+                    and order.state is not OrderState.RELEASED_FOR_DISPATCH:
+                raise ValueError(
+                    "resolution is only valid for an order on hold; order %s is "
+                    "in state %s" % (order.id, order.state.value))
+
             if resolution is Resolution.ADDRESS_CORRECTED:
                 if address is None:
                     raise ValueError(
