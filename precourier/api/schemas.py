@@ -188,6 +188,7 @@ class ConfigUpdateIn(_Strict):
     mode: Optional[str] = None
     max_hold_minutes: Optional[int] = Field(default=None, gt=0)
     reply_window_hours: Optional[int] = Field(default=None, gt=0)
+    payment_fallback: Optional[str] = None
     decision_latency_budget_ms: Optional[int] = Field(default=None, gt=0)
     quiet_hours_start: Optional[int] = Field(default=None, ge=0, le=23)
     quiet_hours_end: Optional[int] = Field(default=None, ge=0, le=23)
@@ -220,6 +221,7 @@ class ConfigOut(BaseModel):
     monthly_incentive_budget_paise: int
     max_hold_minutes: int
     reply_window_hours: int
+    payment_fallback: str
     decision_latency_budget_ms: int
     max_paid_actions_per_order: int
     max_messages_per_buyer_24h: int
@@ -272,6 +274,9 @@ class DecisionOut(BaseModel):
     top_drivers: List[str] = Field(default_factory=list)
     holdout: bool = False
     explanation: Dict[str, Any] = Field(default_factory=dict)
+    payment_link_id: Optional[str] = None
+    payment_link_url: Optional[str] = None
+    payment_link_amount_paise: Optional[int] = None
 
     #: True when the release happened because this system failed rather than
     #: because it decided. Surfaced, not hidden: an order that shipped without a
@@ -300,6 +305,9 @@ class OrderOut(BaseModel):
     payment_method: str
     placed_at: str
     held_until: Optional[str] = None
+    payment_link_id: Optional[str] = None
+    payment_link_url: Optional[str] = None
+    payment_link_amount_paise: Optional[int] = None
     address: Dict[str, str]
     address_revisions: List[Dict[str, Any]] = Field(default_factory=list)
     transitions: List[Dict[str, Any]] = Field(default_factory=list)

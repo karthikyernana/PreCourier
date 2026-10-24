@@ -306,6 +306,80 @@ class OutboxRepo:
             updated_at=str(row["updated_at"]))
 
 
+class PaymentRepo:
+    """Append-only payment intents and durable provider-event claims."""
+
+    def __init__(self, tenant: Tenant) -> None:
+        self._t = tenant
+        self._db = tenant.db
+
+    def record_link(self, order_id: str, *, provider: str, provider_ref: str,
+                    amount_paise: int, idempotency_key: str) -> str:
+        """Record a created link once; provider retries cannot create money rows."""
+        with self._db.tx():
+            existing = self._db.one(
+                "SELECT id FROM payments WHERE merchant_id = :merchant_id "
+                "AND idempotency_key = :key",
+                self._t.scope(key=idempotency_key))
+            if existing is not None:
+                return str(existing["id"])
+            payment_id = self._t.runtime.new_id("payment")
+            self._db.insert("payments", {
+                "id": payment_id, "merchant_id": self._t.merchant_id,
+                "order_id": order_id, "provider": provider,
+                "provider_ref": provider_ref, "amount_paise": int(amount_paise),
+                "status": "link_created", "idempotency_key": idempotency_key,
+                "created_at": self._t.runtime.stamp()})
+        return payment_id
+
+    def record_status(self, order_id: str, *, provider: str, provider_ref: str,
+                      amount_paise: int, status: str,
+                      idempotency_key: str) -> str:
+        """Append a paid/expired observation under its immutable event identity."""
+        with self._db.tx():
+            existing = self._db.one(
+                "SELECT id FROM payments WHERE merchant_id = :merchant_id "
+                "AND idempotency_key = :key",
+                self._t.scope(key=idempotency_key))
+            if existing is not None:
+                return str(existing["id"])
+            payment_id = self._t.runtime.new_id("payment")
+            self._db.insert("payments", {
+                "id": payment_id, "merchant_id": self._t.merchant_id,
+                "order_id": order_id, "provider": provider,
+                "provider_ref": provider_ref, "amount_paise": int(amount_paise),
+                "status": status, "idempotency_key": idempotency_key,
+                "created_at": self._t.runtime.stamp()})
+            if status == "paid":
+                self._t.audit.append(
+                    self._t.merchant_id, AuditKind.PAYMENT_CAPTURED,
+                    {"order_id": order_id, "provider": provider,
+                     "provider_ref": provider_ref,
+                     "amount_paise": int(amount_paise)},
+                    order_id=order_id, actor="provider")
+        return payment_id
+
+    def claim_event(self, *, event_id: str, event: str, order_id: str,
+                    payload: Dict[str, Any], signature: str = "",
+                    provider: str = "razorpay") -> bool:
+        """Claim a provider event; return False for an already-claimed id."""
+        with self._db.tx():
+            existing = self._db.one(
+                "SELECT id FROM provider_events "
+                "WHERE merchant_id = :merchant_id AND provider = :provider "
+                "AND event_id = :event_id",
+                self._t.scope(provider=provider, event_id=event_id))
+            if existing is not None:
+                return False
+            self._db.insert("provider_events", {
+                "id": self._t.runtime.new_id("webhook"),
+                "merchant_id": self._t.merchant_id, "provider": provider,
+                "event_id": event_id, "event": event, "order_id": order_id,
+                "payload_json": canonical.dumps(payload), "signature": signature,
+                "created_at": self._t.runtime.stamp()})
+        return True
+
+
 # ==========================================================================
 # buyers
 # ==========================================================================
@@ -640,6 +714,16 @@ class OrderRepo:
             self._t.scope(x=external_id.strip()))
         return self._to_order(row) if row is not None else None
 
+    def by_payment_link_id(self, payment_link_id: str) -> Optional[Order]:
+        """Find an order by a provider link id, within this tenant only."""
+        if not payment_link_id.strip():
+            return None
+        row = self._db.one(
+            "SELECT * FROM orders "
+            "WHERE merchant_id = :merchant_id AND payment_link_id = :link",
+            self._t.scope(link=payment_link_id.strip()))
+        return self._to_order(row) if row is not None else None
+
     def address(self, order_id: str) -> Address:
         return self.current_revision(order_id).address
 
@@ -822,6 +906,29 @@ class OrderRepo:
                 order_id=order_id)
         return self.current_revision(order_id)
 
+    def attach_payment_link(self, order_id: str, *, link_id: str, url: str,
+                            amount_paise: Paise) -> Order:
+        """Persist provider link metadata without changing commercial facts."""
+        if not link_id.strip() or not url.strip():
+            raise StorageError("a payment link must have an id and URL")
+        if int(amount_paise) < 0:
+            raise StorageError("payment link amount must not be negative")
+        now = self._t.runtime.stamp()
+        with self._db.tx():
+            self.get(order_id)
+            self._db.execute(
+                "UPDATE orders SET payment_link_id = :link, "
+                "payment_link_url = :url, payment_link_amount_paise = :amount, "
+                "updated_at = :at WHERE merchant_id = :merchant_id AND id = :id",
+                self._t.scope(id=order_id, link=link_id, url=url,
+                              amount=int(amount_paise), at=now))
+            self._t.audit.append(
+                self._t.merchant_id, AuditKind.PAYMENT_LINK_CREATED,
+                {"order_id": order_id, "link_id": link_id,
+                 "amount_paise": int(amount_paise)},
+                order_id=order_id, actor="provider")
+        return self.get(order_id)
+
     # ------------------------------------------------------------- internals
 
     def _append_address(self, order_id: str, address: Address, source: str,
@@ -856,6 +963,11 @@ class OrderRepo:
             item_count=int(row["item_count"]), category=str(row["category"]),
             discount_bps=int(row["discount_bps"]),
             placed_at=str(row["placed_at"]), held_until=row["held_until"],
+            payment_link_id=str(row["payment_link_id"] or ""),
+            payment_link_url=str(row["payment_link_url"] or ""),
+            payment_link_amount_paise=(
+                None if row["payment_link_amount_paise"] is None
+                else int(row["payment_link_amount_paise"])),
             is_first_time_buyer=bool(row["is_first_time_buyer"]))
 
     def _address_for(self, address_id: Optional[str]) -> Address:

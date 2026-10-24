@@ -94,6 +94,10 @@ class MerchantConfig:
     mode: Mode = Mode.SHADOW
     max_hold_minutes: int = 240                # hard auto-release; fulfilment is sacred
     reply_window_hours: int = 4
+    #: What happens when a gateway payment offer is not paid before its hold
+    #: deadline. ``ship_cod`` preserves fulfilment; ``cancel`` is for merchants
+    #: who do not want an unpaid offer to enter the carrier network.
+    payment_fallback: str = "ship_cod"
     decision_latency_budget_ms: int = 5000     # p95 target with no buyer contact
 
     # ---- guardrails (PRD section 5) --------------------------------------
@@ -175,6 +179,10 @@ class MerchantConfig:
         if self.max_hold_minutes <= 0:
             raise ConfigError("max_hold_minutes must be positive; fulfilment must "
                               "always be released eventually")
+        if self.payment_fallback not in ("ship_cod", "cancel"):
+            raise ConfigError(
+                "payment_fallback must be ship_cod or cancel, got %r"
+                % self.payment_fallback)
         if not 0 <= self.quiet_hours_start <= 23 or not 0 <= self.quiet_hours_end <= 23:
             raise ConfigError("quiet hours must be hours of a day")
         if self.max_paid_actions_per_order < 1:

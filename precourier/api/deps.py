@@ -60,6 +60,7 @@ class AppState:
     lock: threading.RLock = dataclasses.field(default_factory=threading.RLock)
     decider: Optional[states.Decider] = None
     actor: Optional[states.Actor] = None
+    payment_provider: Any = None
 
     #: Whether the data in this deployment is synthetic. Rendered on every console
     #: page and returned by `/health`, because PRD section 13 requires synthetic
@@ -70,7 +71,8 @@ class AppState:
 
     def service(self, tenant: Tenant, *, arm: str = "live") -> "states.OrderService":
         return states.OrderService(tenant, decider=self.decider,
-                                   actor=self.actor, arm=arm)
+                                   actor=self.actor, arm=arm,
+                                   payment_provider=self.payment_provider)
 
 
 def state_of(request: Request) -> AppState:

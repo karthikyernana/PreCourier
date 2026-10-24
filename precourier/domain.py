@@ -37,8 +37,10 @@ class OrderState(str, enum.Enum):
     NO_ACTION = "no_action"
     ACTING = "acting"
     AWAITING_BUYER = "awaiting_buyer"
+    AWAITING_PAYMENT = "awaiting_payment"
     REPAIRED = "repaired"
     CONVERTED = "converted"
+    PAYMENT_EXPIRED = "payment_expired"
     VERIFIED = "verified"
     ESCALATED = "escalated"
     CANCELLED = "cancelled"
@@ -132,7 +134,8 @@ TRANSITIONS: Dict[OrderState, FrozenSet[OrderState]] = {
         OrderState.CANCELLED, OrderState.RELEASED_FOR_DISPATCH,
     }),
     OrderState.ACTING: frozenset({
-        OrderState.AWAITING_BUYER, OrderState.REPAIRED, OrderState.CONVERTED,
+        OrderState.AWAITING_BUYER, OrderState.AWAITING_PAYMENT,
+        OrderState.REPAIRED, OrderState.CONVERTED,
         OrderState.VERIFIED, OrderState.ESCALATED, OrderState.CANCELLED,
         OrderState.RELEASED_FOR_DISPATCH,
     }),
@@ -142,8 +145,18 @@ TRANSITIONS: Dict[OrderState, FrozenSet[OrderState]] = {
         # The buyer never replied and the hold expired: fulfilment wins.
         OrderState.RELEASED_FOR_DISPATCH,
     }),
+    # Payment offers have their own waiting state. A verified paid callback
+    # records conversion before release; an expiry/cancellation callback first
+    # records that payment failed and then applies the merchant fallback policy.
+    OrderState.AWAITING_PAYMENT: frozenset({
+        OrderState.CONVERTED, OrderState.PAYMENT_EXPIRED,
+        OrderState.RELEASED_FOR_DISPATCH,
+    }),
     OrderState.REPAIRED: frozenset({OrderState.RELEASED_FOR_DISPATCH}),
     OrderState.CONVERTED: frozenset({OrderState.RELEASED_FOR_DISPATCH}),
+    OrderState.PAYMENT_EXPIRED: frozenset({
+        OrderState.RELEASED_FOR_DISPATCH, OrderState.CANCELLED,
+    }),
     OrderState.VERIFIED: frozenset({OrderState.RELEASED_FOR_DISPATCH}),
     OrderState.NO_ACTION: frozenset({OrderState.RELEASED_FOR_DISPATCH}),
     OrderState.ESCALATED: frozenset({
@@ -173,13 +186,15 @@ TERMINAL_STATES = frozenset(
 OPEN_STATES = frozenset({
     OrderState.RECEIVED, OrderState.SCORING, OrderState.DIAGNOSING,
     OrderState.DECIDING, OrderState.ACTING, OrderState.AWAITING_BUYER,
+    OrderState.AWAITING_PAYMENT, OrderState.PAYMENT_EXPIRED,
     OrderState.ESCALATED,
 })
 
 #: States in which the order is waiting on something outside our control, so the
 #: auto-release timer of PRD section 1 applies.
 HOLDING_STATES = frozenset({
-    OrderState.AWAITING_BUYER, OrderState.ESCALATED,
+    OrderState.AWAITING_BUYER, OrderState.AWAITING_PAYMENT,
+    OrderState.ESCALATED,
 })
 
 
@@ -402,6 +417,9 @@ class Order:
     discount_bps: int = 0
     placed_at: str = ""
     held_until: Optional[str] = None       # gateway mode: the auto-release deadline
+    payment_link_id: str = ""
+    payment_link_url: str = ""
+    payment_link_amount_paise: Optional[Paise] = None
     is_first_time_buyer: bool = True
     external_signals: Tuple[Dict[str, object], ...] = ()
 

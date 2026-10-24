@@ -32,6 +32,11 @@ decided:
 * **shadow** -- reason fully, record the counterfactual, touch nothing, release.
 * **advisory** -- act, then release without waiting. Never blocks fulfilment.
 * **gateway** -- act, and hold the label until resolved, cancelled, or timed out.
+
+Payment actions have a separate gateway branch. ``awaiting_payment`` means a
+provider link was created and the label is held. A verified paid event walks the
+order through ``converted`` and then releases it. An expiry/cancellation walks
+through ``payment_expired`` and applies ``payment_fallback`` (ship COD or cancel).
 """
 
 from __future__ import annotations
@@ -39,6 +44,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 import logging
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import guards
@@ -49,8 +55,10 @@ from .domain import (ActionKind, Address, Buyer, CONTACT_ACTIONS, Cause,
                      path_to)
 from .ledger import loss_on_rto, margin_on_delivery, swing
 from .money import Micro, Paise, Ppm
+from .runtime import parse_ts
 from .store.repo import (ActionRepo, BuyerRepo, DecisionRepo, LedgerRepo,
-                          MessageRepo, NotFound, OrderRepo, OutboxRepo)
+                           MessageRepo, NotFound, OrderRepo, OutboxRepo,
+                           PaymentRepo)
 from .tenancy import Tenant
 
 #: Where the detail of a fail-open goes. The audit log records that one happened and
@@ -459,6 +467,9 @@ class Disposition:
     action_id: Optional[str] = None
     degraded: bool = False        # released because we failed, not because we chose
     explanation: Dict[str, Any] = dataclasses.field(default_factory=dict)
+    payment_link_id: Optional[str] = None
+    payment_link_url: Optional[str] = None
+    payment_link_amount_paise: Optional[Paise] = None
 
     @property
     def held(self) -> bool:
@@ -486,11 +497,18 @@ class OrderService:
     """
 
     def __init__(self, tenant: Tenant, *, decider: Optional[Decider] = None,
-                 actor: Optional[Actor] = None, arm: str = "live") -> None:
+                 actor: Optional[Actor] = None, arm: str = "live",
+                 payment_provider: Any = None) -> None:
         self._t = tenant
         self._decider = decider or NullDecider()
         self._actor = actor or NoChannelActor()
         self._arm = arm
+        if payment_provider is None:
+            # Import lazily: adapters.py exposes the provider contract while
+            # states.py owns the lifecycle that consumes it.
+            from .adapters import default_payment_link_provider
+            payment_provider = default_payment_link_provider()
+        self._payment_provider = payment_provider
         self.orders = OrderRepo(tenant)
         self.buyers = BuyerRepo(tenant)
         self.actions = ActionRepo(tenant)
@@ -599,6 +617,10 @@ class OrderService:
         if plan.action is ActionKind.ESCALATE:
             return self._escalate_path(order, verdict, plan, decision)
 
+        if (order.mode is Mode.GATEWAY and plan.action in (
+                ActionKind.PART_PAYMENT, ActionKind.PREPAID_CONVERSION)):
+            return self._payment_path(order, buyer, verdict, plan, decision)
+
         return self._contact_path(order, buyer, verdict, plan, decision)
 
     # ------------------------------------------------------------ mode policy
@@ -681,6 +703,109 @@ class OrderService:
         return self._hold_or_release(
             escalated, verdict, plan, decision,
             hold_minutes=self._t.config.max_hold_minutes)
+
+    def _payment_path(self, order: Order, buyer: Buyer, verdict: Verdict,
+                      plan: _Plan, decision: Any) -> Disposition:
+        """Create a payment link after the action intent is durable.
+
+        The link amount is the immutable order value. ``partial_cod`` asks the
+        provider to accept a partial payment against that amount; ``prepaid_nudge``
+        asks for the full amount. The amount is therefore not a second economics
+        catalogue: the order value and the configured ledger determine it.
+        """
+        guard = self._guard(order, buyer, plan.action, verdict)
+        if not guard.allowed:
+            record = self.actions.record(
+                order.id, plan.action, status="blocked",
+                blocked_reason=guard.code, decision_id=decision.id,
+                incentive_paise=verdict.incentive_paise, arm=self._arm)
+            released = self.orders.release(
+                order.id, reason="payment action refused by a guardrail: %s"
+                % guard.reason())
+            return self._disposition(released, verdict, plan, decision,
+                                     release=True, action_id=record.id,
+                                     blocked_reason=guard.code)
+
+        acting = self.orders.transition(
+            order.id, OrderState.ACTING,
+            reason="attempting %s" % plan.action.value)
+        record = self.actions.record(
+            order.id, plan.action, status="pending", decision_id=decision.id,
+            incentive_paise=verdict.incentive_paise, arm=self._arm)
+        amount_paise = int(order.value_paise)
+        hold_minutes = self._payment_hold_minutes(verdict)
+        # ``Clock.plus_minutes`` intentionally returns the storage timestamp. The
+        # provider contract uses Razorpay's Unix seconds, so convert only at this
+        # boundary without introducing a second time source.
+        expire_by = int(parse_ts(
+            self._t.runtime.clock.plus_minutes(hold_minutes)).timestamp())
+        callback_url = os.environ.get(
+            "RAZORPAY_CALLBACK_URL",
+            "https://precourier.invalid/v1/webhooks/razorpay")
+        notify = {"sms": True, "email": True}
+        idempotency_key = "payment:%s" % record.id
+        outbox = OutboxRepo(self._t).enqueue(
+            order.id, record.id, plan.action,
+            {"action": plan.action.value, "amount_paise": amount_paise,
+             "expire_by": expire_by, "notify": notify,
+             "callback_url": callback_url,
+             "accept_partial": plan.action is ActionKind.PART_PAYMENT},
+            idempotency_key=idempotency_key)
+        OutboxRepo(self._t).mark_processing(outbox.id)
+
+        try:
+            response = self._payment_provider.create(
+                acting, amount_paise=amount_paise,
+                idempotency_key=idempotency_key, expire_by=expire_by,
+                notify=notify, callback_url=callback_url,
+                accept_partial=plan.action is ActionKind.PART_PAYMENT)
+            link_id = str(response.get("id", "")).strip()
+            link_url = str(response.get("short_url") or
+                            response.get("url") or "").strip()
+            if not link_id or not link_url:
+                raise ValueError("payment provider returned no link id and URL")
+        except Exception:
+            OutboxRepo(self._t).fail(outbox.id, "payment_provider_error")
+            self.actions.settle(record.id, "failed",
+                                blocked_reason="payment_provider_error")
+            raise
+
+        provider_name = str(getattr(self._payment_provider, "provider_name",
+                                   self._payment_provider.__class__.__name__))
+        try:
+            with self._t.db.tx():
+                self.orders.attach_payment_link(
+                    order.id, link_id=link_id, url=link_url,
+                    amount_paise=amount_paise)
+                PaymentRepo(self._t).record_link(
+                    order.id, provider=provider_name, provider_ref=link_id,
+                    amount_paise=amount_paise, idempotency_key=idempotency_key)
+                OutboxRepo(self._t).succeed(outbox.id, provider_ref=link_id)
+                self.actions.settle(record.id, "succeeded")
+                self.buyers.record_contact(buyer.id, at=self._t.runtime.stamp())
+                waiting = self.orders.transition(
+                    acting.id, OrderState.AWAITING_PAYMENT,
+                    reason="%s created payment link over %s" %
+                           (plan.action.value, provider_name))
+                held = self.orders.hold(
+                    waiting.id, minutes=hold_minutes,
+                    reason=plan.note or verdict.reason)
+        except Exception:
+            # The provider may already have accepted the link, but the local
+            # reconciliation record did not commit. Leave the durable outbox
+            # retryable and fail open rather than claiming a successful hold.
+            OutboxRepo(self._t).fail(outbox.id, "payment_persistence_error")
+            self.actions.settle(record.id, "failed",
+                                blocked_reason="payment_persistence_error")
+            raise
+        return self._disposition(held, verdict, plan, decision, release=False,
+                                 action_id=record.id)
+
+    def _payment_hold_minutes(self, verdict: Verdict) -> int:
+        wanted = verdict.hold_minutes
+        if wanted is None:
+            wanted = self._t.config.reply_window_hours * 60
+        return min(int(wanted), self._t.config.max_hold_minutes)
 
     def _contact_path(self, order: Order, buyer: Buyer, verdict: Verdict,
                       plan: _Plan, decision: Any) -> Disposition:
@@ -808,6 +933,11 @@ class OrderService:
                 return self._settled(order, reason="already %s"
                                                    % order.state.value)
 
+            if order.state is OrderState.AWAITING_PAYMENT:
+                raise ValueError(
+                    "payment holds resolve only through a verified provider event "
+                    "or the payment hold deadline")
+
             if order.state not in HOLDING_STATES \
                     and order.state is not OrderState.RELEASED_FOR_DISPATCH:
                 raise ValueError(
@@ -900,12 +1030,19 @@ class OrderService:
                     if fresh.state in TERMINAL_STATES \
                             or fresh.state is OrderState.RELEASED_FOR_DISPATCH:
                         continue
-                    moved = self._advance(
-                        fresh, OrderState.RELEASED_FOR_DISPATCH,
-                        reason="hold expired after %d minute(s); fulfilment "
-                               "latency is sacred"
-                               % self._t.config.max_hold_minutes,
-                        actor="timeout")
+                    if fresh.state is OrderState.AWAITING_PAYMENT:
+                        moved = self._expire_payment_state(
+                            fresh,
+                            reason="payment hold expired after %d minute(s)"
+                                   % self._t.config.max_hold_minutes,
+                            actor="timeout")
+                    else:
+                        moved = self._advance(
+                            fresh, OrderState.RELEASED_FOR_DISPATCH,
+                            reason="hold expired after %d minute(s); fulfilment "
+                                   "latency is sacred"
+                                   % self._t.config.max_hold_minutes,
+                            actor="timeout")
                 released.append(self._settled(moved, reason="hold expired"))
             except Exception as exc:            # noqa: BLE001
                 released.append(self._fail_open(order.id, exc))
@@ -914,6 +1051,75 @@ class OrderService:
     def pending_holds(self) -> List[Order]:
         return self.orders.in_states(sorted(HOLDING_STATES,
                                             key=lambda s: s.value))
+
+    # ----------------------------------------------------------- payment events
+
+    def handle_payment_event(self, order_id: str, *, event_id: str,
+                             event: str, payload: Dict[str, Any],
+                             provider_ref: str = "", amount_paise: int = 0,
+                             signature: str = "") -> Tuple[Disposition, bool]:
+        """Apply one verified provider event exactly once.
+
+        The event claim and the lifecycle transition share one transaction. A
+        crash before commit leaves the event retryable; a committed duplicate is
+        acknowledged without moving an order backwards.
+        """
+        with self._t.db.tx():
+            order = self.orders.get(order_id)
+            claimed = PaymentRepo(self._t).claim_event(
+                event_id=event_id, event=event, order_id=order_id,
+                payload=payload, signature=signature)
+            if not claimed:
+                return self._settled(order, reason="duplicate payment event"), True
+
+            if event == "payment_link.paid":
+                if order.state is OrderState.AWAITING_PAYMENT:
+                    PaymentRepo(self._t).record_status(
+                        order.id, provider="razorpay", provider_ref=provider_ref,
+                        amount_paise=amount_paise,
+                        status="paid", idempotency_key="payment-event:%s"
+                        % event_id)
+                    converted = self.orders.transition(
+                        order.id, OrderState.CONVERTED,
+                        reason="payment_link.paid verified")
+                    order = self.orders.release(
+                        converted.id,
+                        reason="payment link paid; converted order released",
+                        actor="provider")
+                return self._settled(order, reason="payment_link.paid"), False
+
+            if event in ("payment_link.expired", "payment_link.cancelled"):
+                PaymentRepo(self._t).record_status(
+                    order.id, provider="razorpay", provider_ref=provider_ref,
+                    amount_paise=amount_paise,
+                    status="expired" if event.endswith("expired") else "cancelled",
+                    idempotency_key="payment-event:%s" % event_id)
+                if order.state is OrderState.AWAITING_PAYMENT:
+                    order = self._expire_payment_state(
+                        order, reason="%s; applying %s fallback" %
+                        (event, self._t.config.payment_fallback),
+                        actor="provider")
+                return self._settled(order, reason=event), False
+
+            # Unknown-but-signed events are recorded for idempotency and safely
+            # ignored. Razorpay retries must not turn an unsupported event into a
+            # dispatch hold or a payment state transition.
+            return self._settled(order, reason="ignored payment event %s" % event), False
+
+    def _expire_payment_state(self, order: Order, *, reason: str,
+                              actor: str) -> Order:
+        """Walk expiry through the explicit state before applying fallback."""
+        expired = self._advance(order, OrderState.PAYMENT_EXPIRED,
+                                reason=reason, actor=actor)
+        if self._t.config.payment_fallback == "cancel":
+            return self._advance(
+                expired, OrderState.CANCELLED,
+                reason="payment expired; merchant fallback cancelled order",
+                actor=actor)
+        return self._advance(
+            expired, OrderState.RELEASED_FOR_DISPATCH,
+            reason="payment expired; merchant fallback ships COD",
+            actor=actor)
 
     # ------------------------------------------------------------- fail-open
 
@@ -989,12 +1195,20 @@ class OrderService:
         if action in PAID_ACTIONS:
             spent = self.ledger.spend_since(guards.month_start(self._t),
                                             arm=self._arm)
+        has_channel = self._actor.available
+        if action in (ActionKind.PART_PAYMENT,
+                      ActionKind.PREPAID_CONVERSION):
+            # A payment link is a payment-provider side effect, not a message
+            # actor send. The API exposes the URL and the merchant may deliver it
+            # through its own checkout/channel, so a missing optional messaging
+            # adapter must not suppress link creation.
+            has_channel = self._payment_provider is not None
         return guards.check(
             self._t, order, buyer, action,
             incentive_paise=verdict.incentive_paise,
             paid_actions_taken=self.actions.paid_count(order.id),
             messages_last_24h=messages, spent_this_month=spent,
-            has_channel=self._actor.available)
+            has_channel=has_channel)
 
     def _advance(self, order: Order, target: OrderState, *, reason: str,
                  actor: str = "agent") -> Order:
@@ -1062,7 +1276,10 @@ class OrderService:
             p_rto_ppm=verdict.p_rto_ppm, threshold_ppm=verdict.threshold_ppm,
             cause=verdict.cause, reason=plan.note or verdict.reason,
             decision_id=getattr(decision, "id", None), action_id=action_id,
-            explanation=dict(verdict.explanation))
+            explanation=dict(verdict.explanation),
+            payment_link_id=order.payment_link_id or None,
+            payment_link_url=order.payment_link_url or None,
+            payment_link_amount_paise=order.payment_link_amount_paise)
 
     def _settled(self, order: Order, *, reason: str) -> Disposition:
         """A disposition for an order we did not re-decide this call.
@@ -1082,4 +1299,7 @@ class OrderService:
             threshold_ppm=latest.threshold_ppm if latest else 0,
             reason=reason,
             decision_id=latest.id if latest else None,
-            explanation=dict(latest.explanation) if latest else {})
+            explanation=dict(latest.explanation) if latest else {},
+            payment_link_id=order.payment_link_id or None,
+            payment_link_url=order.payment_link_url or None,
+            payment_link_amount_paise=order.payment_link_amount_paise)

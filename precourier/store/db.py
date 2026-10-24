@@ -151,6 +151,23 @@ class Database:
             self._conn.execute(
                 "ALTER TABLE merchant_config ADD COLUMN holdout_rate_percent "
                 "INTEGER NOT NULL DEFAULT 10 CHECK (holdout_rate_percent BETWEEN 0 AND 100)")
+        if "payment_fallback" not in columns:
+            self._conn.execute(
+                "ALTER TABLE merchant_config ADD COLUMN payment_fallback "
+                "TEXT NOT NULL DEFAULT 'ship_cod' "
+                "CHECK (payment_fallback IN ('ship_cod', 'cancel'))")
+
+        order_columns = {str(row["name"]) for row in self._conn.execute(
+            "PRAGMA table_info(orders)")}
+        if "payment_link_id" not in order_columns:
+            self._conn.execute(
+                "ALTER TABLE orders ADD COLUMN payment_link_id TEXT NOT NULL DEFAULT ''")
+        if "payment_link_url" not in order_columns:
+            self._conn.execute(
+                "ALTER TABLE orders ADD COLUMN payment_link_url TEXT NOT NULL DEFAULT ''")
+        if "payment_link_amount_paise" not in order_columns:
+            self._conn.execute(
+                "ALTER TABLE orders ADD COLUMN payment_link_amount_paise INTEGER")
 
     def close(self) -> None:
         self._conn.close()

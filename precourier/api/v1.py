@@ -12,6 +12,8 @@ order.
 
 from __future__ import annotations
 
+import json
+import os
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -25,11 +27,13 @@ from ..money import format_paise, to_bps, to_paise
 from ..verify import verify_address_patch
 from ..reporting import roi_report
 from ..historical import HistoricalImportError, project_csv
+from ..runtime import parse_ts
 from ..store.repo import (ActionRepo, BuyerRepo, Conflict, DecisionRepo,
                           MessageRepo, NotFound, OrderRepo, OutcomeRepo,
                           ReasoningRepo)
 from ..tenancy import (ApiKeyRecord, Tenant, issue_api_key, list_api_keys,
-                       save_config, revoke_api_key)
+                       list_merchants, load_tenant, save_config, revoke_api_key)
+from ..webhooks import verify_payload
 from . import schemas
 from .deps import (HTTP_422, Idempotent, get_tenant, idempotency_key,
                    state_of)
@@ -53,6 +57,7 @@ def _config_out(tenant: Tenant) -> Dict[str, Any]:
         monthly_incentive_budget_paise=config.monthly_incentive_budget_paise,
         max_hold_minutes=config.max_hold_minutes,
         reply_window_hours=config.reply_window_hours,
+        payment_fallback=config.payment_fallback,
         decision_latency_budget_ms=config.decision_latency_budget_ms,
         max_paid_actions_per_order=config.max_paid_actions_per_order,
         max_messages_per_buyer_24h=config.max_messages_per_buyer_24h,
@@ -87,6 +92,7 @@ def _updated_config(tenant: Tenant, payload: schemas.ConfigUpdateIn) -> Merchant
         changes["gateway_fee_bps"] = to_bps(payload.gateway_fee_rate)
     direct = (
         "auto_cancel_enabled", "max_hold_minutes", "reply_window_hours",
+        "payment_fallback",
         "decision_latency_budget_ms", "quiet_hours_start", "quiet_hours_end",
         "tz_offset_minutes", "max_paid_actions_per_order",
         "max_messages_per_buyer_24h", "holdout_rate_percent", "origin_pincode")
@@ -146,7 +152,9 @@ def _decision_out(d: states.Disposition) -> Dict[str, Any]:
         degraded=d.degraded, chosen_action=chosen_action,
         runner_up=runner_up, expected_saving_paise=expected_saving,
         top_drivers=top_drivers, holdout=bool(explanation.get("holdout", False)),
-        explanation=explanation).model_dump()
+        explanation=explanation, payment_link_id=d.payment_link_id,
+        payment_link_url=d.payment_link_url,
+        payment_link_amount_paise=d.payment_link_amount_paise).model_dump()
 
 
 def _resolve_order_id(tenant: Tenant, order_id: Optional[str],
@@ -158,6 +166,141 @@ def _resolve_order_id(tenant: Tenant, order_id: Optional[str],
         raise HTTPException(status.HTTP_404_NOT_FOUND,
                             "no order with that reference")
     return order.id
+
+
+def _payment_event_timestamp(payload: Dict[str, Any], header: str) -> int:
+    """Read Razorpay's Unix event time, with an ISO fallback for test fixtures."""
+    value: Any = header.strip() if header.strip() else payload.get("created_at")
+    if value is None:
+        value = (payload.get("payload", {}).get("payment_link", {})
+                 .get("entity", {}).get("created_at"))
+    if value is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            "webhook event timestamp is required")
+    try:
+        text = str(value).strip()
+        return int(text) if text.isdigit() else int(parse_ts(text).timestamp())
+    except (TypeError, ValueError, OverflowError):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            "webhook event timestamp is invalid")
+
+
+def _payment_entity(payload: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        entity = payload["payload"]["payment_link"]["entity"]
+    except (KeyError, TypeError):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            "Razorpay payment_link entity is required")
+    if not isinstance(entity, dict):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            "Razorpay payment_link entity is invalid")
+    return entity
+
+
+def _find_payment_order(app_state: Any, reference_id: str,
+                        link_id: str) -> tuple[Tenant, Any]:
+    """Locate a provider reference by iterating tenant-scoped repositories."""
+    for merchant in list_merchants(app_state.db):
+        tenant = load_tenant(app_state.db, app_state.runtime,
+                             str(merchant["id"]))
+        orders = OrderRepo(tenant)
+        order = (orders.find(reference_id) if reference_id else None)
+        if order is None and reference_id:
+            order = orders.by_external_id(reference_id)
+        if order is None and link_id:
+            order = orders.by_payment_link_id(link_id)
+        if order is not None:
+            return tenant, order
+    raise HTTPException(status.HTTP_404_NOT_FOUND,
+                        "no order for this payment link")
+
+
+@router.post("/webhooks/razorpay", summary="Receive a verified Razorpay payment event")
+async def razorpay_webhook(request: Request) -> Dict[str, Any]:
+    """Verify and apply one Razorpay Payment Link event.
+
+    This route intentionally has no API-key dependency: Razorpay authenticates it
+    with the HMAC over the raw request bytes. The provider event id is claimed in
+    the same transaction as the state transition, so retries are safe.
+    """
+    body = await request.body()
+    secret = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "")
+    if not secret:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
+                            "Razorpay webhook secret is not configured")
+    signature = request.headers.get("X-Razorpay-Signature", "")
+    if not signature or not verify_payload(secret, body, signature):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED,
+                            "invalid Razorpay webhook signature")
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            "webhook body must be valid JSON")
+    if not isinstance(payload, dict):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            "webhook body must be a JSON object")
+
+    app_state = state_of(request)
+    timestamp = _payment_event_timestamp(
+        payload, request.headers.get("X-Razorpay-Timestamp", ""))
+    now = int(app_state.runtime.clock.now().timestamp())
+    try:
+        window = int(os.environ.get(
+            "RAZORPAY_WEBHOOK_REPLAY_WINDOW_SECONDS", "300"))
+    except ValueError:
+        window = 300
+    if window < 1 or abs(now - timestamp) > window:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            "webhook event is outside the replay window")
+
+    event_id = (request.headers.get("X-Razorpay-Event-Id", "").strip()
+                or str(payload.get("id", "")).strip()
+                or str(payload.get("event_id", "")).strip())
+    event = str(payload.get("event", "")).strip()
+    if not event_id or not event:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            "webhook event id and event are required")
+    if event not in {"payment_link.paid", "payment_link.expired",
+                     "payment_link.cancelled"}:
+        # Unknown signed events are still claimed by the normal event path, but
+        # need a payment entity to identify the tenant and order.
+        pass
+    entity = _payment_entity(payload)
+    link_id = str(entity.get("id", "")).strip()
+    reference_id = str(entity.get("reference_id", "")).strip()
+    amount_raw = entity.get("amount", 0) or 0
+    try:
+        amount_paise = int(amount_raw)
+    except (TypeError, ValueError):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            "payment link amount is invalid")
+
+    with app_state.lock:
+        tenant, order = _find_payment_order(app_state, reference_id, link_id)
+        if event in {"payment_link.paid", "payment_link.expired",
+                     "payment_link.cancelled"}:
+            if not link_id:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                                    "payment link id is required")
+            if not order.payment_link_id or order.payment_link_id != link_id:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                                    "payment link does not belong to this order")
+            if "amount" not in entity:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                                    "payment link amount is required")
+            if (order.payment_link_amount_paise is None
+                    or amount_paise != order.payment_link_amount_paise):
+                raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                                    "payment amount does not match the order link")
+        disposition, duplicate = app_state.service(tenant).handle_payment_event(
+            order.id, event_id=event_id, event=event, payload=payload,
+            provider_ref=link_id, amount_paise=(
+                amount_paise or int(order.payment_link_amount_paise or 0)),
+            signature=signature)
+    return {"accepted": True, "duplicate": duplicate, "event_id": event_id,
+            "order_id": order.id, "state": disposition.state.value,
+            "release": disposition.release}
 
 
 # ==========================================================================
@@ -252,6 +395,9 @@ def get_order(request: Request, order_id: str,
             value_paise=order.value_paise,
             payment_method=order.payment_method, placed_at=order.placed_at,
             held_until=order.held_until,
+            payment_link_id=order.payment_link_id or None,
+            payment_link_url=order.payment_link_url or None,
+            payment_link_amount_paise=order.payment_link_amount_paise,
             address={"text": order.address.as_text(),
                      "pincode": order.address.pincode,
                      "city": order.address.city},

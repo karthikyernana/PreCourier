@@ -9,9 +9,10 @@ from __future__ import annotations
 import dataclasses
 import os
 import httpx
-from typing import Any, Dict, Protocol
+from typing import Any, Dict, Mapping, Protocol
 
 from .domain import Address, Channel, Order
+from .runtime import parse_ts
 from .states import Verdict
 
 
@@ -74,7 +75,11 @@ class PaymentAdapter(Protocol):
 
 
 class PaymentLinkProvider(Protocol):
-    def create(self, order: Order, *, amount_paise: int, idempotency_key: str) -> Dict[str, Any]: ...
+    def create(self, order: Order, *, amount_paise: int, idempotency_key: str,
+               expire_by: int | str = 0,
+               notify: Mapping[str, bool] | None = None,
+               callback_url: str = "", accept_partial: bool = False
+               ) -> Dict[str, Any]: ...
 
 
 class MessagingProvider(Protocol):
@@ -82,9 +87,23 @@ class MessagingProvider(Protocol):
 
 
 class FakePaymentLinkProvider:
-    def create(self, order: Order, *, amount_paise: int, idempotency_key: str) -> Dict[str, Any]:
-        return {"id": "fake_" + idempotency_key, "short_url": "https://pay.invalid/" + idempotency_key,
-                "amount": amount_paise, "status": "created"}
+    provider_name = "fake"
+
+    def create(self, order: Order, *, amount_paise: int, idempotency_key: str,
+               expire_by: int | str = 0,
+               notify: Mapping[str, bool] | None = None,
+               callback_url: str = "", accept_partial: bool = False
+               ) -> Dict[str, Any]:
+        return {
+            "id": "fake_" + idempotency_key,
+            "short_url": "https://pay.invalid/" + idempotency_key,
+            "amount": amount_paise,
+            "status": "created",
+            "expire_by": expire_by,
+            "notify": dict(notify or {}),
+            "callback_url": callback_url,
+            "accept_partial": accept_partial,
+        }
 
 
 class FakeMessagingProvider:
@@ -94,22 +113,69 @@ class FakeMessagingProvider:
 
 class RazorpayPaymentLinkProvider:
     """Razorpay test-mode adapter. Transport is injectable and never runs in tests."""
-    def __init__(self, transport: Any = None, *, key_id: str | None = None, key_secret: str | None = None):
+    provider_name = "razorpay"
+
+    def __init__(self, transport: Any = None, *, key_id: str | None = None,
+                 key_secret: str | None = None, callback_url: str | None = None):
         self.transport = transport or httpx.Client()
         self.key_id = key_id or os.environ.get("RAZORPAY_KEY_ID", "")
         self.key_secret = key_secret or os.environ.get("RAZORPAY_KEY_SECRET", "")
+        self.callback_url = callback_url or os.environ.get(
+            "RAZORPAY_CALLBACK_URL",
+            "https://precourier.invalid/v1/webhooks/razorpay")
 
-    def create(self, order: Order, *, amount_paise: int, idempotency_key: str) -> Dict[str, Any]:
+    def create(self, order: Order, *, amount_paise: int, idempotency_key: str,
+               expire_by: int | str = 0,
+               notify: Mapping[str, bool] | None = None,
+               callback_url: str = "", accept_partial: bool = False
+               ) -> Dict[str, Any]:
         if not self.key_id or not self.key_secret:
             raise ProviderError("Razorpay credentials are not configured")
-        response = self.transport.post("https://api.razorpay.com/v1/payment_links",
-            auth=(self.key_id, self.key_secret), headers={"X-Idempotency-Key": idempotency_key},
-            json={"amount": amount_paise, "currency": "INR", "accept_partial": False,
-                  "description": "PreCourier order " + order.id, "reference_id": order.id})
+        response = self._post(
+            "https://api.razorpay.com/v1/payment_links",
+            auth=(self.key_id, self.key_secret),
+            headers={"X-Idempotency-Key": idempotency_key},
+            json={
+                # Razorpay's API is integer paise; the service never gives this
+                # adapter a rupee float to round.
+                "amount": int(amount_paise),
+                "currency": "INR",
+                "accept_partial": bool(accept_partial),
+                "description": "PreCourier order " + order.id,
+                "reference_id": order.id,
+                "expire_by": _unix_seconds(expire_by),
+                "notify": dict(notify or {"sms": True, "email": True}),
+                "customer_notify": True,
+                "callback_url": callback_url or self.callback_url,
+                "callback_method": "get",
+            })
         response.raise_for_status()
         return response.json()
 
+    def _post(self, url: str, **kwargs: Any) -> Any:
+        """Accept either an httpx.Client or a raw MockTransport seam."""
+        if hasattr(self.transport, "post"):
+            return self.transport.post(url, **kwargs)
+        with httpx.Client(transport=self.transport) as client:
+            return client.post(url, **kwargs)
 
-__all__ = ["CarrierAdapter", "CarrierAddressResult", "MessagingAdapter", "PaymentLinkProvider", "MessagingProvider", "FakePaymentLinkProvider", "FakeMessagingProvider", "RazorpayPaymentLinkProvider",
+
+def _unix_seconds(value: int | str) -> int:
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    if text.isdigit():
+        return int(text)
+    return int(parse_ts(text).timestamp())
+
+
+def default_payment_link_provider() -> PaymentLinkProvider:
+    """Select the fake provider unless both Razorpay credentials are present."""
+    if os.environ.get("RAZORPAY_KEY_ID") and os.environ.get("RAZORPAY_KEY_SECRET"):
+        return RazorpayPaymentLinkProvider()
+    return FakePaymentLinkProvider()
+
+
+__all__ = ["CarrierAdapter", "CarrierAddressResult", "MessagingAdapter", "PaymentLinkProvider", "MessagingProvider", "FakePaymentLinkProvider", "FakeMessagingProvider", "RazorpayPaymentLinkProvider", "default_payment_link_provider",
            "PaymentAdapter", "ProviderError", "ProviderMessage", "ProviderUnknown",
            "ServiceabilityResult", "StoreAdapter"]

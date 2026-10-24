@@ -39,6 +39,7 @@ from fastapi.responses import HTMLResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .. import states
+from ..adapters import PaymentLinkProvider, default_payment_link_provider
 from ..audit import AuditLog
 from ..runtime import Runtime, SystemClock
 from ..store.db import SCHEMA_VERSION, Database
@@ -64,6 +65,7 @@ def create_app(*, db: Optional[Database] = None,
                runtime: Optional[Runtime] = None,
                decider: Optional[states.Decider] = None,
                actor: Optional[states.Actor] = None,
+               payment_provider: Optional[PaymentLinkProvider] = None,
                db_path: Optional[str] = None,
                synthetic: bool = False,
                sweeper: Optional[bool] = None) -> FastAPI:
@@ -90,6 +92,8 @@ def create_app(*, db: Optional[Database] = None,
         # remains injectable for backwards-compatible deployments and tests.
         decider=decider if decider is not None else states.ProfitDecisionDecider(),
         actor=actor if actor is not None else states.NoChannelActor(),
+        payment_provider=(payment_provider if payment_provider is not None
+                          else default_payment_link_provider()),
         synthetic=synthetic)
 
     app = FastAPI(
