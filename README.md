@@ -17,6 +17,8 @@ The default application uses a deterministic rule model and no outbound provider
 ## Run
 
 ```bash
+python -m venv .venv
+./.venv/bin/pip install -e ".[dev]"
 ./.venv/bin/pytest -q
 ./.venv/bin/python -m precourier.backtest --seed 42
 ```
