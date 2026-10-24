@@ -403,6 +403,7 @@ class Order:
     placed_at: str = ""
     held_until: Optional[str] = None       # gateway mode: the auto-release deadline
     is_first_time_buyer: bool = True
+    external_signals: Tuple[Dict[str, object], ...] = ()
 
     @property
     def is_cod(self) -> bool:
@@ -433,6 +434,7 @@ class RiskScore:
     model_version: str
     features_id: str = ""
     raw_ppm: Optional[Ppm] = None          # pre-calibration, for the drift report
+    cause_probabilities: Dict[str, Ppm] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass(frozen=True)

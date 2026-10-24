@@ -7,6 +7,8 @@ must implement. They do not instantiate vendors or claim live integration.
 from __future__ import annotations
 
 import dataclasses
+import os
+import httpx
 from typing import Any, Dict, Protocol
 
 from .domain import Address, Channel, Order
@@ -71,6 +73,41 @@ class PaymentAdapter(Protocol):
     def verify_callback(self, body: bytes, signature: str) -> Dict[str, Any]: ...
 
 
-__all__ = ["CarrierAdapter", "CarrierAddressResult", "MessagingAdapter",
+class PaymentLinkProvider(Protocol):
+    def create(self, order: Order, *, amount_paise: int, idempotency_key: str) -> Dict[str, Any]: ...
+
+
+class MessagingProvider(Protocol):
+    def send(self, order: Order, *, body: str, idempotency_key: str) -> ProviderMessage: ...
+
+
+class FakePaymentLinkProvider:
+    def create(self, order: Order, *, amount_paise: int, idempotency_key: str) -> Dict[str, Any]:
+        return {"id": "fake_" + idempotency_key, "short_url": "https://pay.invalid/" + idempotency_key,
+                "amount": amount_paise, "status": "created"}
+
+
+class FakeMessagingProvider:
+    def send(self, order: Order, *, body: str, idempotency_key: str) -> ProviderMessage:
+        return ProviderMessage(True, "fake", idempotency_key, body)
+
+
+class RazorpayPaymentLinkProvider:
+    """Razorpay test-mode adapter. Transport is injectable and never runs in tests."""
+    def __init__(self, transport: Any = None, *, key_id: str | None = None, key_secret: str | None = None):
+        self.transport = transport or httpx.Client()
+        self.key_id = key_id or os.environ.get("RAZORPAY_KEY_ID", "")
+        self.key_secret = key_secret or os.environ.get("RAZORPAY_KEY_SECRET", "")
+
+    def create(self, order: Order, *, amount_paise: int, idempotency_key: str) -> Dict[str, Any]:
+        response = self.transport.post("https://api.razorpay.com/v1/payment_links",
+            auth=(self.key_id, self.key_secret), headers={"X-Razorpay-Account": idempotency_key},
+            json={"amount": amount_paise, "currency": "INR", "accept_partial": False,
+                  "description": "PreCourier order " + order.id, "reference_id": order.id})
+        response.raise_for_status()
+        return response.json()
+
+
+__all__ = ["CarrierAdapter", "CarrierAddressResult", "MessagingAdapter", "PaymentLinkProvider", "MessagingProvider", "FakePaymentLinkProvider", "FakeMessagingProvider", "RazorpayPaymentLinkProvider",
            "PaymentAdapter", "ProviderError", "ProviderMessage", "ProviderUnknown",
            "ServiceabilityResult", "StoreAdapter"]
