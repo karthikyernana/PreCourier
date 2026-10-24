@@ -10,8 +10,11 @@ import hashlib
 import math
 from typing import Dict, Iterable, Mapping, Protocol, Sequence
 
-from .domain import Cause, Order
+from .domain import ActionKind, Cause, Order
 from .intelligence import Features
+from .config import MerchantConfig
+from .ledger import breakdown
+from .domain import OutcomeKind
 from .money import PPM, Paise
 
 
@@ -117,6 +120,25 @@ def expected_net_paise(order_value_paise: int, probabilities: CauseProbabilities
     remaining = max(0, p - reductions)
     abandon = max(0, PPM - p) * action.abandonment_ppm // PPM
     return ((PPM - remaining) * delivered - remaining * rto_loss_paise) // PPM - action.direct_cost_paise - action.delay_cost_paise - abandon * delivered // PPM
+
+
+def specs_from_config(config: MerchantConfig, *, incentive_paise: int = 0) -> tuple[ActionSpec, ...]:
+    """Build the engine catalogue from the canonical rupee ledger configuration.
+
+    The old fixed catalogue remains available for compatibility with callers that
+    use the pure primitive. Live decisions use this function so merchant overrides
+    cannot diverge from ``ledger.py`` economics.
+    """
+    def cost(name):
+        return config.economics(name).cost_paise
+    return (
+        ActionSpec("ship_as_is", 0, {}),
+        ActionSpec("confirm_intent", cost(ActionKind.CONTACT_VERIFY), {"refusal": 300_000}, 50_000, 50),
+        ActionSpec("fix_address", cost(ActionKind.ADDRESS_REPAIR), {"bad_address": 650_000}, 30_000, 50),
+        ActionSpec("partial_cod", cost(ActionKind.PART_PAYMENT), {"refusal": 450_000}, 100_000, 100),
+        ActionSpec("prepaid_nudge", cost(ActionKind.PREPAID_CONVERSION) + incentive_paise, {"refusal": 500_000}, 80_000, 100),
+        ActionSpec("cancel", cost(ActionKind.CANCEL), {"refusal": PPM, "unreachable_buyer": PPM, "bad_address": PPM}),
+    )
 
 
 def choose_action(order: Order, probabilities: CauseProbabilities, *, actions: Sequence[ActionSpec] = DEFAULT_ACTIONS,

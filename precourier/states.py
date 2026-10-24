@@ -190,6 +190,52 @@ class RuleDecider(Decider):
             diagnosis=diagnosis)
 
 
+class ProfitDecisionDecider(Decider):
+    """Live Stage 1 decider: intelligence features feed the rupee argmax engine."""
+
+    def __init__(self, *, reference: Any = None, model_version: str = "rule-cause-v1") -> None:
+        self._reference = reference
+        self._model_version = model_version
+
+    def decide(self, tenant: Tenant, order: Order, buyer: Buyer) -> Verdict:
+        from .geo import REFERENCE
+        from .intelligence import build_features, diagnose
+        from .decision_engine import RuleRiskModel, choose_action, specs_from_config
+        features = build_features(order, buyer, config=tenant.config,
+                                  reference=self._reference or REFERENCE)
+        probabilities = RuleRiskModel().predict(order, features)
+        decision = choose_action(order, probabilities,
+                                 actions=specs_from_config(tenant.config))
+        cause_map = {"bad_address": Cause.ADDRESS_DEFECT,
+                     "unreachable_buyer": Cause.UNREACHABLE_CONTACT,
+                     "refusal": Cause.WEAK_INTENT}
+        diagnosis = diagnose(features)
+        action_map = {"confirm_intent": ActionKind.CONTACT_VERIFY,
+                      "fix_address": ActionKind.ADDRESS_REPAIR,
+                      "partial_cod": ActionKind.PART_PAYMENT,
+                      "prepaid_nudge": ActionKind.PREPAID_CONVERSION,
+                      "cancel": ActionKind.CANCEL,
+                      "ship_as_is": ActionKind.NO_ACTION}
+        chosen = action_map[decision.chosen_action]
+        if chosen is ActionKind.CANCEL and not tenant.config.auto_cancel_enabled:
+            chosen = ActionKind.ESCALATE
+        drivers = decision.top_drivers
+        return Verdict(action=chosen, p_rto_ppm=probabilities.rto_ppm,
+                       cause=cause_map.get(drivers[0], diagnosis.cause),
+                       expected_delta_micro=decision.expected_saving_paise * 1_000_000,
+                       reason="%s; saving=%d paise; runner_up=%s" %
+                              (decision.chosen_action, decision.expected_saving_paise,
+                               decision.runner_up), model_version=self._model_version,
+                       evidence=diagnosis.evidence,
+                       gate_inputs={"cause_probabilities": probabilities.as_dict(),
+                                    "chosen": decision.chosen_action,
+                                    "runner_up": decision.runner_up,
+                                    "expected_saving_paise": decision.expected_saving_paise,
+                                    "top_drivers": list(drivers)},
+                       feature_payload=features.first_pass_mapping(),
+                       risk_score=probabilities, diagnosis=diagnosis)
+
+
 # ==========================================================================
 # what actually reaches the buyer
 # ==========================================================================

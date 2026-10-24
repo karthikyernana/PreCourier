@@ -100,8 +100,10 @@ class RazorpayPaymentLinkProvider:
         self.key_secret = key_secret or os.environ.get("RAZORPAY_KEY_SECRET", "")
 
     def create(self, order: Order, *, amount_paise: int, idempotency_key: str) -> Dict[str, Any]:
+        if not self.key_id or not self.key_secret:
+            raise ProviderError("Razorpay credentials are not configured")
         response = self.transport.post("https://api.razorpay.com/v1/payment_links",
-            auth=(self.key_id, self.key_secret), headers={"X-Razorpay-Account": idempotency_key},
+            auth=(self.key_id, self.key_secret), headers={"X-Idempotency-Key": idempotency_key},
             json={"amount": amount_paise, "currency": "INR", "accept_partial": False,
                   "description": "PreCourier order " + order.id, "reference_id": order.id})
         response.raise_for_status()
