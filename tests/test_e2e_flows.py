@@ -29,7 +29,7 @@ def _order(client, external_id="e2e-1"):
 
 def test_running_api_order_outcome_reports_and_console_contract():
     with httpx.Client(base_url=BASE, headers={"X-API-Key": KEY}, timeout=10) as client:
-        assert client.get("/v1/health").is_success
+        assert client.get("/health").is_success
         decision = _order(client)
         order_id = decision["order_id"]
         assert client.get(f"/v1/orders/{order_id}").json()["order_id"] == order_id
