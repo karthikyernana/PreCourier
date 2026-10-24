@@ -103,6 +103,10 @@ class MerchantConfig:
     max_paid_actions_per_order: int = 1        # prevents message stacking
     max_messages_per_buyer_24h: int = 1        # frequency cap
 
+    # ---- evaluation -------------------------------------------------------
+    #: Deterministic control-group share for measuring the counterfactual.
+    holdout_rate_percent: int = 10
+
     #: Where this merchant's buyers are contacted, and therefore which consent
     #: flag is checked before any message goes out.
     #:
@@ -175,6 +179,10 @@ class MerchantConfig:
             raise ConfigError("quiet hours must be hours of a day")
         if self.max_paid_actions_per_order < 1:
             raise ConfigError("max_paid_actions_per_order must be at least 1")
+        if not 0 <= self.holdout_rate_percent <= 100:
+            raise ConfigError(
+                "holdout_rate_percent must be within 0..100, got %d"
+                % self.holdout_rate_percent)
         return self
 
     def replace(self, **changes: object) -> "MerchantConfig":

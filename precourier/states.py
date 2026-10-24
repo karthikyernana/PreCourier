@@ -45,7 +45,9 @@ from . import guards
 from .audit import AuditKind
 from .domain import (ActionKind, Address, Buyer, CONTACT_ACTIONS, Cause,
                      Channel, Evidence, HOLDING_STATES, Mode, Order,
-                     OrderState, PAID_ACTIONS, TERMINAL_STATES, path_to)
+                     OrderState, PAID_ACTIONS, RiskScore, TERMINAL_STATES,
+                     path_to)
+from .ledger import loss_on_rto, margin_on_delivery, swing
 from .money import Micro, Paise, Ppm
 from .store.repo import (ActionRepo, BuyerRepo, DecisionRepo, LedgerRepo,
                           MessageRepo, NotFound, OrderRepo, OutboxRepo)
@@ -103,6 +105,10 @@ class Verdict:
     feature_payload: Optional[Dict[str, Any]] = None
     risk_score: Any = None
     diagnosis: Any = None
+    #: Stage 1's immutable rupee explanation. The service persists it with the
+    #: decision row and carries it through to every API disposition.
+    explanation: Dict[str, Any] = dataclasses.field(default_factory=dict)
+    holdout: bool = False
 
 
 class Decider:
@@ -200,12 +206,24 @@ class ProfitDecisionDecider(Decider):
     def decide(self, tenant: Tenant, order: Order, buyer: Buyer) -> Verdict:
         from .geo import REFERENCE
         from .intelligence import build_features, diagnose
-        from .decision_engine import RuleRiskModel, choose_action, specs_from_config
+        from .decision_engine import (RuleRiskModel, choose_action, in_holdout,
+                                      specs_from_config)
         features = build_features(order, buyer, config=tenant.config,
                                   reference=self._reference or REFERENCE)
         probabilities = RuleRiskModel().predict(order, features)
+        actions = specs_from_config(tenant.config)
+        eligible_actions = {
+            spec.name for spec in actions
+            if spec.name != "cancel"
+            or (tenant.config.auto_cancel_enabled
+                and order.value_paise < tenant.config.value_review_threshold_paise)
+        }
         decision = choose_action(order, probabilities,
-                                 actions=specs_from_config(tenant.config))
+                                 actions=actions,
+                                 config=tenant.config,
+                                 eligible_actions=eligible_actions)
+        holdout = in_holdout(order.id, tenant.merchant_id,
+                             tenant.config.holdout_rate_percent)
         cause_map = {"bad_address": Cause.ADDRESS_DEFECT,
                      "unreachable_buyer": Cause.UNREACHABLE_CONTACT,
                      "refusal": Cause.WEAK_INTENT}
@@ -228,12 +246,45 @@ class ProfitDecisionDecider(Decider):
                                decision.runner_up), model_version=self._model_version,
                        evidence=diagnosis.evidence,
                        gate_inputs={"cause_probabilities": probabilities.as_dict(),
-                                    "chosen": decision.chosen_action,
-                                    "runner_up": decision.runner_up,
-                                    "expected_saving_paise": decision.expected_saving_paise,
-                                    "top_drivers": list(drivers)},
-                       feature_payload=features.first_pass_mapping(),
-                       risk_score=probabilities, diagnosis=diagnosis)
+                                     "chosen": decision.chosen_action,
+                                     "runner_up": decision.runner_up,
+                                     "expected_saving_paise": decision.expected_saving_paise,
+                                     "margin_paise": margin_on_delivery(
+                                         tenant.config, order.value_paise),
+                                     "loss_paise": loss_on_rto(
+                                         tenant.config, order.value_paise),
+                                     "swing_paise": swing(
+                                         tenant.config, order.value_paise),
+                                     "top_drivers": list(drivers),
+                                     "evaluations": [
+                                         {"action": item.action,
+                                          "expected_net_paise": item.expected_net_paise,
+                                          "eligible": item.eligible}
+                                         for item in decision.evaluations]},
+                        feature_payload=features.first_pass_mapping(),
+                        risk_score=RiskScore(
+                            p_rto_ppm=probabilities.rto_ppm,
+                            # ``rule-v1`` is the persisted score vocabulary used
+                            # by the pre-Stage-1 console; the richer cause/action
+                            # explanation is stored beside it and is versioned by
+                            # the verdict below.
+                            model_version="rule-v1",
+                            raw_ppm=probabilities.rto_ppm,
+                            cause_probabilities=probabilities.as_dict()),
+                        diagnosis=diagnosis,
+                        explanation={
+                            "chosen_action": decision.chosen_action,
+                            "runner_up": decision.runner_up,
+                            "expected_saving_paise": decision.expected_saving_paise,
+                            "top_drivers": list(drivers),
+                            "holdout": holdout,
+                            "cause_probabilities": probabilities.as_dict(),
+                            "evaluations": [
+                                {"action": item.action,
+                                 "expected_net_paise": item.expected_net_paise,
+                                 "eligible": item.eligible}
+                                for item in decision.evaluations]},
+                        holdout=holdout)
 
 
 # ==========================================================================
@@ -407,6 +458,7 @@ class Disposition:
     decision_id: Optional[str] = None
     action_id: Optional[str] = None
     degraded: bool = False        # released because we failed, not because we chose
+    explanation: Dict[str, Any] = dataclasses.field(default_factory=dict)
 
     @property
     def held(self) -> bool:
@@ -561,6 +613,15 @@ class OrderService:
         """
         action = verdict.action
         mode = order.mode
+
+        if verdict.holdout:
+            if action is ActionKind.NO_ACTION:
+                return _Plan(ActionKind.NO_ACTION,
+                             note="holdout order: ship_as_is")
+            return _Plan(
+                ActionKind.NO_ACTION, suppressed=True,
+                note="holdout order: would have taken %s, took nothing"
+                     % action.value)
 
         if mode is Mode.SHADOW:
             if action is ActionKind.NO_ACTION:
@@ -971,13 +1032,16 @@ class OrderService:
                 order.id, verdict.action, reason=plan.note,
                 threshold_ppm=verdict.threshold_ppm,
                 expected_delta_micro=verdict.expected_delta_micro,
-                gate_inputs=inputs)
+                gate_inputs=inputs, risk_score_id=verdict.risk_score_id,
+                diagnosis_id=verdict.diagnosis_id,
+                explanation=verdict.explanation)
         return self.decisions.record(
             order.id, plan.action,
             expected_delta_micro=verdict.expected_delta_micro,
             threshold_ppm=verdict.threshold_ppm, gate_inputs=inputs,
             reason=verdict.reason, risk_score_id=verdict.risk_score_id,
-            diagnosis_id=verdict.diagnosis_id)
+            diagnosis_id=verdict.diagnosis_id,
+            explanation=verdict.explanation)
 
     def _persist_reasoning(self, order: Order, verdict: Verdict) -> Tuple[str, str, str]:
         """Persist the immutable reasoning artifacts inside the pipeline transaction."""
@@ -997,7 +1061,8 @@ class OrderService:
             suppressed=plan.suppressed, blocked_reason=blocked_reason,
             p_rto_ppm=verdict.p_rto_ppm, threshold_ppm=verdict.threshold_ppm,
             cause=verdict.cause, reason=plan.note or verdict.reason,
-            decision_id=getattr(decision, "id", None), action_id=action_id)
+            decision_id=getattr(decision, "id", None), action_id=action_id,
+            explanation=dict(verdict.explanation))
 
     def _settled(self, order: Order, *, reason: str) -> Disposition:
         """A disposition for an order we did not re-decide this call.
@@ -1016,4 +1081,5 @@ class OrderService:
             recommended=latest.action if latest else ActionKind.NO_ACTION,
             threshold_ppm=latest.threshold_ppm if latest else 0,
             reason=reason,
-            decision_id=latest.id if latest else None)
+            decision_id=latest.id if latest else None,
+            explanation=dict(latest.explanation) if latest else {})

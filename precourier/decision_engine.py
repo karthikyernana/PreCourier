@@ -7,14 +7,12 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
-import math
 from typing import Dict, Iterable, Mapping, Protocol, Sequence
 
 from .domain import ActionKind, Cause, Order
 from .intelligence import Features
 from .config import MerchantConfig
-from .ledger import breakdown
-from .domain import OutcomeKind
+from .ledger import loss_on_rto, margin_on_delivery
 from .money import PPM, Paise
 
 
@@ -50,12 +48,16 @@ class RuleRiskModel:
     """
     def predict(self, order: Order, features: Features) -> CauseProbabilities:
         refusal = 35_000 + min(500_000, features.refusal_ratio_ppm // 2)
-        refusal += 100_000 if features.is_first_time_buyer else 0
+        # First-time status is a weak prior, not evidence of refusal. A fresh,
+        # otherwise complete address must stay ship_as_is until observable return
+        # behaviour justifies an intervention.
+        refusal += 20_000 if features.is_first_time_buyer else 0
         unreachable = 25_000 + (250_000 if not features.phone_format_valid else 0)
         unreachable += min(200_000, features.duplicate_phone_count * 40_000)
         bad = 25_000 + (180_000 if not features.has_house_number else 0)
         bad += 120_000 if not features.pincode_city_consistent else 0
         bad += 100_000 if not features.pincode_known else 0
+        bad += 100_000 if not features.has_landmark else 0
         adjustments = {cause: 0 for cause in CAUSES}
         for signal in order.external_signals:
             try:
@@ -112,14 +114,32 @@ class Decision:
 
 def expected_net_paise(order_value_paise: int, probabilities: CauseProbabilities,
                        action: ActionSpec, *, margin_bps: int = 3000,
-                       rto_loss_paise: int = 19500) -> int:
-    delivered = order_value_paise * margin_bps // 10_000
+                       rto_loss_paise: int = 19500,
+                       config: MerchantConfig | None = None) -> int:
+    """Return an action's expected contribution in integer paise.
+
+    The primitive keeps its historical defaults for standalone callers. Live
+    decisions pass ``config`` so the delivered margin and RTO loss come from the
+    canonical ledger rather than from a second set of economics hidden in the
+    decision engine.
+    """
+    if config is None:
+        delivered = order_value_paise * margin_bps // 10_000
+        rto_loss = rto_loss_paise
+    else:
+        delivered = margin_on_delivery(config, order_value_paise)
+        rto_loss = loss_on_rto(config, order_value_paise)
+    # Cancellation prevents packing; it does not turn a would-be RTO into a
+    # delivered order. Keeping this branch here avoids overstating cancellation
+    # value while retaining the generic reduction arithmetic for repairs.
+    if action.name == "cancel":
+        return -action.direct_cost_paise - action.delay_cost_paise
     p = probabilities.rto_ppm
     reductions = sum(probabilities.as_dict().get(c, 0) * reduction // PPM
                      for c, reduction in action.reductions_ppm.items())
     remaining = max(0, p - reductions)
     abandon = max(0, PPM - p) * action.abandonment_ppm // PPM
-    return ((PPM - remaining) * delivered - remaining * rto_loss_paise) // PPM - action.direct_cost_paise - action.delay_cost_paise - abandon * delivered // PPM
+    return ((PPM - remaining) * delivered - remaining * rto_loss) // PPM - action.direct_cost_paise - action.delay_cost_paise - abandon * delivered // PPM
 
 
 def specs_from_config(config: MerchantConfig, *, incentive_paise: int = 0) -> tuple[ActionSpec, ...]:
@@ -142,10 +162,19 @@ def specs_from_config(config: MerchantConfig, *, incentive_paise: int = 0) -> tu
 
 
 def choose_action(order: Order, probabilities: CauseProbabilities, *, actions: Sequence[ActionSpec] = DEFAULT_ACTIONS,
-                  margin_bps: int = 3000, rto_loss_paise: int = 19500) -> Decision:
-    values = tuple(ActionEvaluation(a.name, expected_net_paise(order.value_paise, probabilities, a,
-                                                               margin_bps=margin_bps, rto_loss_paise=rto_loss_paise)) for a in actions)
-    ranked = sorted(values, key=lambda x: (x.expected_net_paise, x.action), reverse=True)
+                  margin_bps: int = 3000, rto_loss_paise: int = 19500,
+                  config: MerchantConfig | None = None,
+                  eligible_actions: Iterable[str] | None = None) -> Decision:
+    allowed = None if eligible_actions is None else set(eligible_actions)
+    values = tuple(ActionEvaluation(
+        a.name,
+        expected_net_paise(order.value_paise, probabilities, a,
+                           margin_bps=margin_bps,
+                           rto_loss_paise=rto_loss_paise,
+                           config=config),
+        eligible=allowed is None or a.name in allowed) for a in actions)
+    ranked = sorted((x for x in values if x.eligible),
+                    key=lambda x: (x.expected_net_paise, x.action), reverse=True)
     baseline = next(x.expected_net_paise for x in values if x.action == "ship_as_is")
     chosen = ranked[0]
     return Decision(chosen.action, values, ranked[1].action if len(ranked) > 1 else chosen.action,

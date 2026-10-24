@@ -102,7 +102,9 @@ CREATE TABLE IF NOT EXISTS merchant_config (
     max_paid_actions_per_order       INTEGER NOT NULL
                                      CHECK (max_paid_actions_per_order >= 1),
     max_messages_per_buyer_24h       INTEGER NOT NULL
-                                     CHECK (max_messages_per_buyer_24h >= 0),
+                                      CHECK (max_messages_per_buyer_24h >= 0),
+    holdout_rate_percent             INTEGER NOT NULL DEFAULT 10
+                                      CHECK (holdout_rate_percent BETWEEN 0 AND 100),
     default_channel                  TEXT NOT NULL DEFAULT 'simulated'
                                      CHECK (default_channel IN ('simulated',
                                             'telegram', 'whatsapp', 'sms')),
@@ -319,6 +321,27 @@ CREATE TABLE IF NOT EXISTS decisions (
     created_at            TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS decisions_order ON decisions(order_id);
+
+-- Stage 1's rupee explanation is separate from the existing decision claim so
+-- older decision rows remain readable. The direct paise/action columns make the
+-- merchant-facing explanation queryable; the JSON columns retain the full scored
+-- cause and action comparison without duplicating economics elsewhere.
+CREATE TABLE IF NOT EXISTS decision_explanations (
+    decision_id              TEXT NOT NULL PRIMARY KEY REFERENCES decisions(id),
+    merchant_id              TEXT NOT NULL REFERENCES merchants(id),
+    order_id                 TEXT NOT NULL REFERENCES orders(id),
+    chosen_action            TEXT NOT NULL,
+    runner_up                TEXT NOT NULL,
+    expected_saving_paise    INTEGER NOT NULL CHECK (expected_saving_paise >= 0),
+    top_drivers_json         TEXT NOT NULL,
+    holdout                  INTEGER NOT NULL DEFAULT 0
+                             CHECK (holdout IN (0, 1)),
+    cause_probabilities_json TEXT NOT NULL DEFAULT '{}',
+    evaluations_json         TEXT NOT NULL DEFAULT '[]',
+    created_at               TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS decision_explanations_order
+    ON decision_explanations(merchant_id, order_id, created_at);
 
 CREATE TABLE IF NOT EXISTS actions (
     id               TEXT NOT NULL PRIMARY KEY,
@@ -611,6 +634,14 @@ BEGIN SELECT RAISE(ABORT, 'decisions is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS decisions_no_delete
 BEFORE DELETE ON decisions
 BEGIN SELECT RAISE(ABORT, 'decisions is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS decision_explanations_no_update
+BEFORE UPDATE ON decision_explanations
+BEGIN SELECT RAISE(ABORT, 'decision_explanations is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS decision_explanations_no_delete
+BEFORE DELETE ON decision_explanations
+BEGIN SELECT RAISE(ABORT, 'decision_explanations is immutable'); END;
 
 CREATE TRIGGER IF NOT EXISTS messages_no_update
 BEFORE UPDATE ON messages

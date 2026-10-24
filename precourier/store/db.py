@@ -31,9 +31,9 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence
 SCHEMA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "schema.sql")
 
-#: Bumped when `schema.sql` changes in a way an existing file cannot absorb by
-#: re-running the DDL. Every statement in `schema.sql` is `IF NOT EXISTS`, so
-#: additive changes need no migration; a destructive one would.
+#: The public schema version remains stable for additive Stage 1 tables. The one
+#: additive column below is applied explicitly for databases created by Stage 0;
+#: this keeps an existing merchant database usable without a destructive rewrite.
 SCHEMA_VERSION = 1
 
 #: Filenames the agent's runtime is not allowed to open. See module docstring.
@@ -130,6 +130,7 @@ class Database:
             ddl = handle.read()
         # executescript() commits any open transaction, so it runs outside `tx`.
         self._conn.executescript(ddl)
+        self._apply_additive_migrations()
         row = self._conn.execute(
             "SELECT MAX(version) AS v FROM schema_version").fetchone()
         if row is None or row["v"] is None:
@@ -141,6 +142,15 @@ class Database:
                 "database at %s was written by schema version %d; this build "
                 "understands %d. Refusing to run against a newer schema."
                 % (self.path, int(row["v"]), SCHEMA_VERSION))
+
+    def _apply_additive_migrations(self) -> None:
+        """Bring columns added after the initial schema into old SQLite files."""
+        columns = {str(row["name"]) for row in self._conn.execute(
+            "PRAGMA table_info(merchant_config)")}
+        if "holdout_rate_percent" not in columns:
+            self._conn.execute(
+                "ALTER TABLE merchant_config ADD COLUMN holdout_rate_percent "
+                "INTEGER NOT NULL DEFAULT 10 CHECK (holdout_rate_percent BETWEEN 0 AND 100)")
 
     def close(self) -> None:
         self._conn.close()

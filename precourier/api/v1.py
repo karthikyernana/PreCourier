@@ -55,7 +55,8 @@ def _config_out(tenant: Tenant) -> Dict[str, Any]:
         reply_window_hours=config.reply_window_hours,
         decision_latency_budget_ms=config.decision_latency_budget_ms,
         max_paid_actions_per_order=config.max_paid_actions_per_order,
-        max_messages_per_buyer_24h=config.max_messages_per_buyer_24h).model_dump()
+        max_messages_per_buyer_24h=config.max_messages_per_buyer_24h,
+        holdout_rate_percent=config.holdout_rate_percent).model_dump()
 
 
 def _key_out(record: ApiKeyRecord, plaintext: Optional[str] = None) -> Dict[str, Any]:
@@ -88,7 +89,7 @@ def _updated_config(tenant: Tenant, payload: schemas.ConfigUpdateIn) -> Merchant
         "auto_cancel_enabled", "max_hold_minutes", "reply_window_hours",
         "decision_latency_budget_ms", "quiet_hours_start", "quiet_hours_end",
         "tz_offset_minutes", "max_paid_actions_per_order",
-        "max_messages_per_buyer_24h", "origin_pincode")
+        "max_messages_per_buyer_24h", "holdout_rate_percent", "origin_pincode")
     for name in direct:
         value = getattr(payload, name)
         if value is not None:
@@ -130,6 +131,11 @@ def _enum(cls: Any, value: str, field: str) -> Any:
 
 
 def _decision_out(d: states.Disposition) -> Dict[str, Any]:
+    explanation = dict(d.explanation or {})
+    chosen_action = str(explanation.get("chosen_action", "no_action"))
+    runner_up = str(explanation.get("runner_up", ""))
+    expected_saving = int(explanation.get("expected_saving_paise", 0))
+    top_drivers = list(explanation.get("top_drivers", []))
     return schemas.DecisionOut(
         order_id=d.order_id, state=d.state.value, mode=d.mode.value,
         release=d.release, held_until=d.held_until, action=d.action.value,
@@ -137,7 +143,10 @@ def _decision_out(d: states.Disposition) -> Dict[str, Any]:
         blocked_reason=d.blocked_reason, p_rto_ppm=d.p_rto_ppm,
         threshold_ppm=d.threshold_ppm, cause=d.cause.value, reason=d.reason,
         decision_id=d.decision_id, action_id=d.action_id,
-        degraded=d.degraded).model_dump()
+        degraded=d.degraded, chosen_action=chosen_action,
+        runner_up=runner_up, expected_saving_paise=expected_saving,
+        top_drivers=top_drivers, holdout=bool(explanation.get("holdout", False)),
+        explanation=explanation).model_dump()
 
 
 def _resolve_order_id(tenant: Tenant, order_id: Optional[str],
@@ -257,9 +266,16 @@ def get_order(request: Request, order_id: str,
             decisions=[
                 {"id": d.id, "action": d.action.value, "reason": d.reason,
                  "threshold_ppm": d.threshold_ppm,
-                 "expected_delta_micro": d.expected_delta_micro,
-                 "gate_inputs": d.gate_inputs,
-                 "config_revision": d.config_revision, "at": d.created_at}
+                  "expected_delta_micro": d.expected_delta_micro,
+                  "gate_inputs": d.gate_inputs,
+                  "config_revision": d.config_revision,
+                  "chosen_action": d.explanation.get("chosen_action", ""),
+                  "runner_up": d.explanation.get("runner_up", ""),
+                  "expected_saving_paise": d.explanation.get(
+                      "expected_saving_paise", 0),
+                  "top_drivers": d.explanation.get("top_drivers", []),
+                  "holdout": d.explanation.get("holdout", False),
+                  "explanation": d.explanation, "at": d.created_at}
                 for d in decisions],
             features=reasoning["features"],
             risk_scores=reasoning["risk_scores"],

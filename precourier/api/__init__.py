@@ -86,7 +86,9 @@ def create_app(*, db: Optional[Database] = None,
 
     app_state = AppState(
         db=db, runtime=runtime, audit=AuditLog(db, runtime),
-        decider=decider if decider is not None else states.RuleDecider(),
+        # Stage 1 is the default live order path. The older one-cause decider
+        # remains injectable for backwards-compatible deployments and tests.
+        decider=decider if decider is not None else states.ProfitDecisionDecider(),
         actor=actor if actor is not None else states.NoChannelActor(),
         synthetic=synthetic)
 

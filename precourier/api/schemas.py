@@ -194,6 +194,7 @@ class ConfigUpdateIn(_Strict):
     tz_offset_minutes: Optional[int] = None
     max_paid_actions_per_order: Optional[int] = Field(default=None, ge=1)
     max_messages_per_buyer_24h: Optional[int] = Field(default=None, ge=0)
+    holdout_rate_percent: Optional[int] = Field(default=None, ge=0, le=100)
     default_channel: Optional[str] = None
     origin_pincode: Optional[str] = None
 
@@ -222,6 +223,7 @@ class ConfigOut(BaseModel):
     decision_latency_budget_ms: int
     max_paid_actions_per_order: int
     max_messages_per_buyer_24h: int
+    holdout_rate_percent: int
 
 
 class ApiKeyOut(BaseModel):
@@ -260,6 +262,16 @@ class DecisionOut(BaseModel):
     reason: str = ""
     decision_id: Optional[str] = None
     action_id: Optional[str] = None
+
+    #: Stage 1's engine vocabulary is retained alongside the lifecycle vocabulary
+    #: above. ``action`` says what the service did; this says what the rupee argmax
+    #: selected, including a shadow or holdout counterfactual.
+    chosen_action: str = "no_action"
+    runner_up: str = ""
+    expected_saving_paise: int = 0
+    top_drivers: List[str] = Field(default_factory=list)
+    holdout: bool = False
+    explanation: Dict[str, Any] = Field(default_factory=dict)
 
     #: True when the release happened because this system failed rather than
     #: because it decided. Surfaced, not hidden: an order that shipped without a
