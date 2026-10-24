@@ -15,7 +15,7 @@ POST /v1/orders/{id}/release
 POST /v1/orders/{id}/cancel
 POST /v1/outcomes
 POST /v1/holds/sweep
-GET  /v1/health
+GET  /health
 POST /v1/backtest
 GET  /v1/reports/roi
 GET  /v1/audit

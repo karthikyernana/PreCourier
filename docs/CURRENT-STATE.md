@@ -39,7 +39,7 @@ The default decision path now uses the deterministic `RuleDecider`; it persists 
 - `POST /v1/backtest`
 - `GET /v1/reports/roi`
 - `GET /v1/audit`
-- `GET /v1/health` (plus `/health`)
+- `GET /health`
 
 The report endpoints now use synthetic provenance for backtests and persisted merchant provenance for live ROI. Historical CSV onboarding, a real carrier/channel, and a full merchant UI are still implementation targets.
 

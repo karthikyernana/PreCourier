@@ -17,6 +17,8 @@ The default application uses a deterministic rule model and no outbound provider
 ## Run
 
 ```bash
+python -m venv .venv
+./.venv/bin/pip install -e ".[dev]"
 ./.venv/bin/pytest -q
 ./.venv/bin/python -m precourier.backtest --seed 42
 ```
@@ -53,7 +55,7 @@ must be stable for the lifetime of the database and must come from a secret stor
 in any shared environment.
 
 ```bash
-curl http://127.0.0.1:8000/v1/health
+curl http://127.0.0.1:8000/health
 ```
 
 ## API inspection flow
@@ -100,7 +102,7 @@ The result contains three arms, nine sensitivity cells, ten fixed seeds, and a
 synthetic-data disclosure. It is not a merchant performance claim.
 
 ```bash
-curl http://127.0.0.1:8000/v1/health
+curl http://127.0.0.1:8000/health
 ```
 
 ## Documentation
