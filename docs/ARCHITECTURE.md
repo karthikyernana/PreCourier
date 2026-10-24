@@ -21,12 +21,12 @@ HTTP request
 Store/OMS
   -> signed canonical order + idempotency
   -> synchronous decision service
-       -> features -> risk -> diagnosis -> gate
+        -> features -> cause probabilities -> diagnosis -> economic gate
   -> durable decision and action intent
   -> commit
   -> durable outbox executor
        -> messaging / carrier / payment / store adapter
-  -> provider result and reconciliation
+        -> provider result and reconciliation (fake by default; Razorpay test adapter)
   -> fulfilment release/hold/cancel
   -> carrier outcome
   -> ledger + training label + report

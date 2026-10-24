@@ -48,3 +48,11 @@ contracts. These are interfaces, not vendor integrations. A live adapter must
 return provider identity, accept an idempotency key, distinguish rejection from
 unknown provider state, and pass contract tests before it is enabled for a
 merchant.
+# Stage 1 decision fields
+
+The decision engine accepts optional `external_signals` on an order. Each item is
+`{"provider": "delhivery|shiprocket|gokwik|other", "score": 0..1, "label": "..."}`.
+The baseline blends each valid signal conservatively into its labelled cause and
+stores integer PPM probabilities for refusal, unreachable buyer, bad address, and
+overall RTO. Provider calls use the fake adapters by default; Razorpay test mode
+requires `RAZORPAY_KEY_ID` and `RAZORPAY_KEY_SECRET`.
