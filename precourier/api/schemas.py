@@ -93,6 +93,8 @@ class OrderIn(_Strict):
             raise ValueError(
                 "supply exactly one of `value` (rupees as a decimal string) or "
                 "`value_paise` (integer paise)")
+        if self.value is not None and to_paise(self.value) < 0:
+            raise ValueError("order value must be non-negative")
         return self
 
     def paise(self) -> Paise:
