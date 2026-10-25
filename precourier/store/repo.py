@@ -306,6 +306,80 @@ class OutboxRepo:
             updated_at=str(row["updated_at"]))
 
 
+class PaymentRepo:
+    """Append-only payment intents and durable provider-event claims."""
+
+    def __init__(self, tenant: Tenant) -> None:
+        self._t = tenant
+        self._db = tenant.db
+
+    def record_link(self, order_id: str, *, provider: str, provider_ref: str,
+                    amount_paise: int, idempotency_key: str) -> str:
+        """Record a created link once; provider retries cannot create money rows."""
+        with self._db.tx():
+            existing = self._db.one(
+                "SELECT id FROM payments WHERE merchant_id = :merchant_id "
+                "AND idempotency_key = :key",
+                self._t.scope(key=idempotency_key))
+            if existing is not None:
+                return str(existing["id"])
+            payment_id = self._t.runtime.new_id("payment")
+            self._db.insert("payments", {
+                "id": payment_id, "merchant_id": self._t.merchant_id,
+                "order_id": order_id, "provider": provider,
+                "provider_ref": provider_ref, "amount_paise": int(amount_paise),
+                "status": "link_created", "idempotency_key": idempotency_key,
+                "created_at": self._t.runtime.stamp()})
+        return payment_id
+
+    def record_status(self, order_id: str, *, provider: str, provider_ref: str,
+                      amount_paise: int, status: str,
+                      idempotency_key: str) -> str:
+        """Append a paid/expired observation under its immutable event identity."""
+        with self._db.tx():
+            existing = self._db.one(
+                "SELECT id FROM payments WHERE merchant_id = :merchant_id "
+                "AND idempotency_key = :key",
+                self._t.scope(key=idempotency_key))
+            if existing is not None:
+                return str(existing["id"])
+            payment_id = self._t.runtime.new_id("payment")
+            self._db.insert("payments", {
+                "id": payment_id, "merchant_id": self._t.merchant_id,
+                "order_id": order_id, "provider": provider,
+                "provider_ref": provider_ref, "amount_paise": int(amount_paise),
+                "status": status, "idempotency_key": idempotency_key,
+                "created_at": self._t.runtime.stamp()})
+            if status == "paid":
+                self._t.audit.append(
+                    self._t.merchant_id, AuditKind.PAYMENT_CAPTURED,
+                    {"order_id": order_id, "provider": provider,
+                     "provider_ref": provider_ref,
+                     "amount_paise": int(amount_paise)},
+                    order_id=order_id, actor="provider")
+        return payment_id
+
+    def claim_event(self, *, event_id: str, event: str, order_id: str,
+                    payload: Dict[str, Any], signature: str = "",
+                    provider: str = "razorpay") -> bool:
+        """Claim a provider event; return False for an already-claimed id."""
+        with self._db.tx():
+            existing = self._db.one(
+                "SELECT id FROM provider_events "
+                "WHERE merchant_id = :merchant_id AND provider = :provider "
+                "AND event_id = :event_id",
+                self._t.scope(provider=provider, event_id=event_id))
+            if existing is not None:
+                return False
+            self._db.insert("provider_events", {
+                "id": self._t.runtime.new_id("webhook"),
+                "merchant_id": self._t.merchant_id, "provider": provider,
+                "event_id": event_id, "event": event, "order_id": order_id,
+                "payload_json": canonical.dumps(payload), "signature": signature,
+                "created_at": self._t.runtime.stamp()})
+        return True
+
+
 # ==========================================================================
 # buyers
 # ==========================================================================
@@ -640,6 +714,16 @@ class OrderRepo:
             self._t.scope(x=external_id.strip()))
         return self._to_order(row) if row is not None else None
 
+    def by_payment_link_id(self, payment_link_id: str) -> Optional[Order]:
+        """Find an order by a provider link id, within this tenant only."""
+        if not payment_link_id.strip():
+            return None
+        row = self._db.one(
+            "SELECT * FROM orders "
+            "WHERE merchant_id = :merchant_id AND payment_link_id = :link",
+            self._t.scope(link=payment_link_id.strip()))
+        return self._to_order(row) if row is not None else None
+
     def address(self, order_id: str) -> Address:
         return self.current_revision(order_id).address
 
@@ -822,6 +906,29 @@ class OrderRepo:
                 order_id=order_id)
         return self.current_revision(order_id)
 
+    def attach_payment_link(self, order_id: str, *, link_id: str, url: str,
+                            amount_paise: Paise) -> Order:
+        """Persist provider link metadata without changing commercial facts."""
+        if not link_id.strip() or not url.strip():
+            raise StorageError("a payment link must have an id and URL")
+        if int(amount_paise) < 0:
+            raise StorageError("payment link amount must not be negative")
+        now = self._t.runtime.stamp()
+        with self._db.tx():
+            self.get(order_id)
+            self._db.execute(
+                "UPDATE orders SET payment_link_id = :link, "
+                "payment_link_url = :url, payment_link_amount_paise = :amount, "
+                "updated_at = :at WHERE merchant_id = :merchant_id AND id = :id",
+                self._t.scope(id=order_id, link=link_id, url=url,
+                              amount=int(amount_paise), at=now))
+            self._t.audit.append(
+                self._t.merchant_id, AuditKind.PAYMENT_LINK_CREATED,
+                {"order_id": order_id, "link_id": link_id,
+                 "amount_paise": int(amount_paise)},
+                order_id=order_id, actor="provider")
+        return self.get(order_id)
+
     # ------------------------------------------------------------- internals
 
     def _append_address(self, order_id: str, address: Address, source: str,
@@ -856,6 +963,11 @@ class OrderRepo:
             item_count=int(row["item_count"]), category=str(row["category"]),
             discount_bps=int(row["discount_bps"]),
             placed_at=str(row["placed_at"]), held_until=row["held_until"],
+            payment_link_id=str(row["payment_link_id"] or ""),
+            payment_link_url=str(row["payment_link_url"] or ""),
+            payment_link_amount_paise=(
+                None if row["payment_link_amount_paise"] is None
+                else int(row["payment_link_amount_paise"])),
             is_first_time_buyer=bool(row["is_first_time_buyer"]))
 
     def _address_for(self, address_id: Optional[str]) -> Address:
@@ -1076,6 +1188,44 @@ class LedgerRepo:
 # decisions and actions
 # ==========================================================================
 
+def _normalise_decision_explanation(
+        explanation: Optional[Dict[str, Any]], action: ActionKind
+        ) -> Dict[str, Any]:
+    """Return the stable DB/API shape for a Stage 1 explanation.
+
+    Older deciders do not produce the richer object. They still get an explicit
+    explanation row, which keeps the read contract total without inventing any
+    probabilities or economics for a model that did not provide them.
+    """
+    source = dict(explanation or {})
+    return {
+        "chosen_action": str(source.get("chosen_action", action.value)),
+        "runner_up": str(source.get("runner_up", action.value)),
+        "expected_saving_paise": max(
+            0, int(source.get("expected_saving_paise", 0))),
+        "top_drivers": [str(item) for item in source.get("top_drivers", [])],
+        "holdout": bool(source.get("holdout", False)),
+        "cause_probabilities": dict(source.get("cause_probabilities", {})),
+        "evaluations": list(source.get("evaluations", [])),
+    }
+
+
+def _explanation_from_row(row: Any) -> Dict[str, Any]:
+    """Decode the left-joined explanation, tolerating pre-Stage 1 rows."""
+    if row["explanation_chosen_action"] is None:
+        return {}
+    return {
+        "chosen_action": str(row["explanation_chosen_action"]),
+        "runner_up": str(row["explanation_runner_up"]),
+        "expected_saving_paise": int(row["explanation_expected_saving_paise"]),
+        "top_drivers": canonical.loads(str(row["explanation_top_drivers_json"])),
+        "holdout": bool(row["explanation_holdout"]),
+        "cause_probabilities": canonical.loads(
+            str(row["explanation_cause_probabilities_json"])),
+        "evaluations": canonical.loads(str(row["explanation_evaluations_json"])),
+    }
+
+
 @dataclasses.dataclass(frozen=True)
 class DecisionRecord:
     """A stored decision, complete enough to re-explain months later."""
@@ -1089,6 +1239,7 @@ class DecisionRecord:
     reason: str
     config_revision: int
     created_at: str
+    explanation: Dict[str, Any] = dataclasses.field(default_factory=dict)
 
 
 class DecisionRepo:
@@ -1112,8 +1263,10 @@ class DecisionRepo:
                expected_delta_micro: int = 0, threshold_ppm: int = 0,
                gate_inputs: Optional[Dict[str, Any]] = None,
                reason: str = "", risk_score_id: Optional[str] = None,
-               diagnosis_id: Optional[str] = None) -> DecisionRecord:
+               diagnosis_id: Optional[str] = None,
+               explanation: Optional[Dict[str, Any]] = None) -> DecisionRecord:
         inputs = dict(gate_inputs or {})
+        explanation = _normalise_decision_explanation(explanation, action)
         # Serialised canonically, so two identical decisions produce byte-identical
         # rows and a diff between two runs of the backtest is a real difference
         # rather than a key-ordering artefact.
@@ -1131,25 +1284,42 @@ class DecisionRepo:
                 "threshold_ppm": int(threshold_ppm),
                 "gate_inputs_json": payload, "reason": reason,
                 "config_revision": revision, "created_at": now})
+            self._db.insert("decision_explanations", {
+                "decision_id": decision_id, "merchant_id": self._t.merchant_id,
+                "order_id": order_id,
+                "chosen_action": explanation["chosen_action"],
+                "runner_up": explanation["runner_up"],
+                "expected_saving_paise": explanation["expected_saving_paise"],
+                "top_drivers_json": canonical.dumps(explanation["top_drivers"]),
+                "holdout": int(bool(explanation["holdout"])),
+                "cause_probabilities_json": canonical.dumps(
+                    explanation["cause_probabilities"]),
+                "evaluations_json": canonical.dumps(explanation["evaluations"]),
+                "created_at": now})
             self._t.audit.append(
                 self._t.merchant_id, AuditKind.DECISION_MADE,
                 {"decision_id": decision_id, "order_id": order_id,
                  "action": action.value,
                  "expected_delta_micro": int(expected_delta_micro),
-                 "threshold_ppm": int(threshold_ppm), "reason": reason,
-                 "config_revision": revision, "gate_inputs": inputs},
+                  "threshold_ppm": int(threshold_ppm), "reason": reason,
+                  "explanation": explanation,
+                  "config_revision": revision, "gate_inputs": inputs},
                 order_id=order_id)
 
         return DecisionRecord(
             id=decision_id, order_id=order_id, action=action,
             expected_delta_micro=int(expected_delta_micro),
             threshold_ppm=int(threshold_ppm), gate_inputs=inputs,
-            reason=reason, config_revision=revision, created_at=now)
+            reason=reason, config_revision=revision, created_at=now,
+            explanation=explanation)
 
     def suppressed(self, order_id: str, action: ActionKind, *,
                    reason: str, threshold_ppm: int = 0,
                    expected_delta_micro: int = 0,
-                   gate_inputs: Optional[Dict[str, Any]] = None) -> DecisionRecord:
+                   gate_inputs: Optional[Dict[str, Any]] = None,
+                   risk_score_id: Optional[str] = None,
+                   diagnosis_id: Optional[str] = None,
+                   explanation: Optional[Dict[str, Any]] = None) -> DecisionRecord:
         """Record a decision the mode forbade acting on. Shadow mode's whole output.
 
         Stored with the action the gate actually chose, not with `no_action`,
@@ -1161,7 +1331,9 @@ class DecisionRepo:
         """
         record = self.record(
             order_id, action, expected_delta_micro=expected_delta_micro,
-            threshold_ppm=threshold_ppm, gate_inputs=gate_inputs, reason=reason)
+            threshold_ppm=threshold_ppm, gate_inputs=gate_inputs, reason=reason,
+            risk_score_id=risk_score_id, diagnosis_id=diagnosis_id,
+            explanation=explanation)
         self._t.audit.append(
             self._t.merchant_id, AuditKind.DECISION_SUPPRESSED,
             {"decision_id": record.id, "order_id": order_id,
@@ -1171,9 +1343,17 @@ class DecisionRepo:
 
     def for_order(self, order_id: str) -> List[DecisionRecord]:
         return [self._to_record(r) for r in self._db.all(
-            "SELECT * FROM decisions "
-            "WHERE merchant_id = :merchant_id AND order_id = :o "
-            "ORDER BY created_at, id",
+            "SELECT d.*, e.chosen_action AS explanation_chosen_action, "
+            "e.runner_up AS explanation_runner_up, "
+            "e.expected_saving_paise AS explanation_expected_saving_paise, "
+            "e.top_drivers_json AS explanation_top_drivers_json, "
+            "e.holdout AS explanation_holdout, "
+            "e.cause_probabilities_json AS explanation_cause_probabilities_json, "
+            "e.evaluations_json AS explanation_evaluations_json "
+            "FROM decisions d LEFT JOIN decision_explanations e "
+            "ON e.decision_id = d.id AND e.merchant_id = d.merchant_id "
+            "WHERE d.merchant_id = :merchant_id AND d.order_id = :o "
+            "ORDER BY d.created_at, d.id",
             self._t.scope(o=order_id))]
 
     def latest(self, order_id: str) -> Optional[DecisionRecord]:
@@ -1199,7 +1379,8 @@ class DecisionRepo:
             gate_inputs=canonical.loads(str(row["gate_inputs_json"])),
             reason=str(row["reason"]),
             config_revision=int(row["config_revision"]),
-            created_at=str(row["created_at"]))
+            created_at=str(row["created_at"]),
+            explanation=_explanation_from_row(row))
 
 
 #: An action's lifecycle. `blocked` is not a failure: it records that a guardrail

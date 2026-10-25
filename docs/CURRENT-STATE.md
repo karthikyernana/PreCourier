@@ -53,3 +53,9 @@ The report endpoints now use synthetic provenance for backtests and persisted me
 - Outcome retries, correction identity, and cross-tenant foreign-key ownership need explicit enforcement.
 
 These are tracked in `docs/ROADMAP.md` and must not be hidden by new feature work.
+# Stage 1 status
+
+Pure Stage 1 decision primitives are available in `precourier/decision_engine.py`:
+cause probabilities, external signal adjustment, six-action integer economics,
+merchant holdout hashing, and provider adapters. Live persistence/API wiring and
+the action-expanded backtest remain open limits.

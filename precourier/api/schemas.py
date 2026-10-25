@@ -188,12 +188,14 @@ class ConfigUpdateIn(_Strict):
     mode: Optional[str] = None
     max_hold_minutes: Optional[int] = Field(default=None, gt=0)
     reply_window_hours: Optional[int] = Field(default=None, gt=0)
+    payment_fallback: Optional[str] = None
     decision_latency_budget_ms: Optional[int] = Field(default=None, gt=0)
     quiet_hours_start: Optional[int] = Field(default=None, ge=0, le=23)
     quiet_hours_end: Optional[int] = Field(default=None, ge=0, le=23)
     tz_offset_minutes: Optional[int] = None
     max_paid_actions_per_order: Optional[int] = Field(default=None, ge=1)
     max_messages_per_buyer_24h: Optional[int] = Field(default=None, ge=0)
+    holdout_rate_percent: Optional[int] = Field(default=None, ge=0, le=100)
     default_channel: Optional[str] = None
     origin_pincode: Optional[str] = None
 
@@ -219,9 +221,11 @@ class ConfigOut(BaseModel):
     monthly_incentive_budget_paise: int
     max_hold_minutes: int
     reply_window_hours: int
+    payment_fallback: str
     decision_latency_budget_ms: int
     max_paid_actions_per_order: int
     max_messages_per_buyer_24h: int
+    holdout_rate_percent: int
 
 
 class ApiKeyOut(BaseModel):
@@ -261,6 +265,19 @@ class DecisionOut(BaseModel):
     decision_id: Optional[str] = None
     action_id: Optional[str] = None
 
+    #: Stage 1's engine vocabulary is retained alongside the lifecycle vocabulary
+    #: above. ``action`` says what the service did; this says what the rupee argmax
+    #: selected, including a shadow or holdout counterfactual.
+    chosen_action: str = "no_action"
+    runner_up: str = ""
+    expected_saving_paise: int = 0
+    top_drivers: List[str] = Field(default_factory=list)
+    holdout: bool = False
+    explanation: Dict[str, Any] = Field(default_factory=dict)
+    payment_link_id: Optional[str] = None
+    payment_link_url: Optional[str] = None
+    payment_link_amount_paise: Optional[int] = None
+
     #: True when the release happened because this system failed rather than
     #: because it decided. Surfaced, not hidden: an order that shipped without a
     #: decision must not be counted as one the agent chose to leave alone.
@@ -288,6 +305,9 @@ class OrderOut(BaseModel):
     payment_method: str
     placed_at: str
     held_until: Optional[str] = None
+    payment_link_id: Optional[str] = None
+    payment_link_url: Optional[str] = None
+    payment_link_amount_paise: Optional[int] = None
     address: Dict[str, str]
     address_revisions: List[Dict[str, Any]] = Field(default_factory=list)
     transitions: List[Dict[str, Any]] = Field(default_factory=list)

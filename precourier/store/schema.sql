@@ -92,6 +92,8 @@ CREATE TABLE IF NOT EXISTS merchant_config (
                                      CHECK (mode IN ('shadow', 'advisory', 'gateway')),
     max_hold_minutes                 INTEGER NOT NULL CHECK (max_hold_minutes > 0),
     reply_window_hours               INTEGER NOT NULL CHECK (reply_window_hours > 0),
+    payment_fallback                 TEXT NOT NULL DEFAULT 'ship_cod'
+                                     CHECK (payment_fallback IN ('ship_cod', 'cancel')),
     decision_latency_budget_ms       INTEGER NOT NULL CHECK (decision_latency_budget_ms > 0),
 
     quiet_hours_start                INTEGER NOT NULL
@@ -102,7 +104,9 @@ CREATE TABLE IF NOT EXISTS merchant_config (
     max_paid_actions_per_order       INTEGER NOT NULL
                                      CHECK (max_paid_actions_per_order >= 1),
     max_messages_per_buyer_24h       INTEGER NOT NULL
-                                     CHECK (max_messages_per_buyer_24h >= 0),
+                                      CHECK (max_messages_per_buyer_24h >= 0),
+    holdout_rate_percent             INTEGER NOT NULL DEFAULT 10
+                                      CHECK (holdout_rate_percent BETWEEN 0 AND 100),
     default_channel                  TEXT NOT NULL DEFAULT 'simulated'
                                      CHECK (default_channel IN ('simulated',
                                             'telegram', 'whatsapp', 'sms')),
@@ -215,6 +219,9 @@ CREATE TABLE IF NOT EXISTS orders (
     current_address_id  TEXT,
     held_until          TEXT,
     released_at         TEXT,
+    payment_link_id     TEXT NOT NULL DEFAULT '',
+    payment_link_url    TEXT NOT NULL DEFAULT '',
+    payment_link_amount_paise INTEGER CHECK (payment_link_amount_paise >= 0),
     created_at          TEXT NOT NULL,
     updated_at          TEXT NOT NULL
 );
@@ -320,6 +327,27 @@ CREATE TABLE IF NOT EXISTS decisions (
 );
 CREATE INDEX IF NOT EXISTS decisions_order ON decisions(order_id);
 
+-- Stage 1's rupee explanation is separate from the existing decision claim so
+-- older decision rows remain readable. The direct paise/action columns make the
+-- merchant-facing explanation queryable; the JSON columns retain the full scored
+-- cause and action comparison without duplicating economics elsewhere.
+CREATE TABLE IF NOT EXISTS decision_explanations (
+    decision_id              TEXT NOT NULL PRIMARY KEY REFERENCES decisions(id),
+    merchant_id              TEXT NOT NULL REFERENCES merchants(id),
+    order_id                 TEXT NOT NULL REFERENCES orders(id),
+    chosen_action            TEXT NOT NULL,
+    runner_up                TEXT NOT NULL,
+    expected_saving_paise    INTEGER NOT NULL CHECK (expected_saving_paise >= 0),
+    top_drivers_json         TEXT NOT NULL,
+    holdout                  INTEGER NOT NULL DEFAULT 0
+                             CHECK (holdout IN (0, 1)),
+    cause_probabilities_json TEXT NOT NULL DEFAULT '{}',
+    evaluations_json         TEXT NOT NULL DEFAULT '[]',
+    created_at               TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS decision_explanations_order
+    ON decision_explanations(merchant_id, order_id, created_at);
+
 CREATE TABLE IF NOT EXISTS actions (
     id               TEXT NOT NULL PRIMARY KEY,
     merchant_id      TEXT NOT NULL REFERENCES merchants(id),
@@ -371,6 +399,24 @@ CREATE TABLE IF NOT EXISTS payments (
     created_at       TEXT NOT NULL,
     UNIQUE (merchant_id, idempotency_key)
 );
+
+-- Provider callbacks are claimed before their business transition in the same
+-- transaction. The provider event id, not a timestamp or payload hash, is the
+-- durable idempotency identity.
+CREATE TABLE IF NOT EXISTS provider_events (
+    id               TEXT NOT NULL PRIMARY KEY,
+    merchant_id      TEXT NOT NULL REFERENCES merchants(id),
+    provider         TEXT NOT NULL,
+    event_id         TEXT NOT NULL,
+    event            TEXT NOT NULL,
+    order_id         TEXT,
+    payload_json     TEXT NOT NULL,
+    signature        TEXT NOT NULL DEFAULT '',
+    created_at       TEXT NOT NULL,
+    UNIQUE (merchant_id, provider, event_id)
+);
+CREATE INDEX IF NOT EXISTS provider_events_order
+    ON provider_events(merchant_id, order_id, created_at);
 
 CREATE TABLE IF NOT EXISTS outcomes (
     id              TEXT NOT NULL PRIMARY KEY,
@@ -612,6 +658,14 @@ CREATE TRIGGER IF NOT EXISTS decisions_no_delete
 BEFORE DELETE ON decisions
 BEGIN SELECT RAISE(ABORT, 'decisions is immutable'); END;
 
+CREATE TRIGGER IF NOT EXISTS decision_explanations_no_update
+BEFORE UPDATE ON decision_explanations
+BEGIN SELECT RAISE(ABORT, 'decision_explanations is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS decision_explanations_no_delete
+BEFORE DELETE ON decision_explanations
+BEGIN SELECT RAISE(ABORT, 'decision_explanations is immutable'); END;
+
 CREATE TRIGGER IF NOT EXISTS messages_no_update
 BEFORE UPDATE ON messages
 BEGIN SELECT RAISE(ABORT, 'messages is immutable'); END;
@@ -643,6 +697,8 @@ BEFORE DELETE ON models
 BEGIN SELECT RAISE(ABORT, 'models is append-only: retire, do not delete'); END;
 
 -- An order may change state, hold deadline, mode and current address revision.
+-- A payment link is also operationally mutable: it is created only after the
+-- decision is committed and is retained on the order for reconciliation.
 -- Nothing else. In particular its value and its buyer are fixed at intake, so a
 -- decision can never be re-explained against a value that has since been edited.
 --
@@ -665,7 +721,7 @@ WHEN OLD.merchant_id    <> NEW.merchant_id
   OR OLD.discount_bps   <> NEW.discount_bps
   OR OLD.is_first_time_buyer <> NEW.is_first_time_buyer
 BEGIN
-    SELECT RAISE(ABORT, 'orders: only state, mode, current_address_id, held_until, released_at and updated_at may change');
+    SELECT RAISE(ABORT, 'orders: only state, mode, current_address_id, held_until, released_at, payment link fields and updated_at may change');
 END;
 
 CREATE TRIGGER IF NOT EXISTS orders_no_delete

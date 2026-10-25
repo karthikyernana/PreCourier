@@ -2,9 +2,9 @@
 
 PreCourier is India-first, pre-dispatch COD decision infrastructure. It evaluates an order before label creation, explains the likely delivery constraint, and applies merchant-specific rupee economics before choosing whether to intervene.
 
-## Current MVP
+## Current Stage 1
 
-The current repository contains a tested vertical slice:
+The current repository contains a tested vertical slice and a deterministic Stage 1 profit-decision engine:
 
 ```text
 order intake -> observable rule risk -> cause evidence -> ledger gate
@@ -12,7 +12,7 @@ order intake -> observable rule risk -> cause evidence -> ledger gate
   -> append-only address revision -> release -> delivered/RTO outcome -> report
 ```
 
-The default application uses a deterministic rule model and no outbound provider. It does not call WhatsApp, SMS, Telegram, carriers, stores, or payment providers. Synthetic backtest results are labelled synthetic and are not customer evidence. The simulated channel exists only in automated verification tests and is not selected by a normal application launch.
+The baseline `RuleRiskModel` produces integer-PPM probabilities for refusal, unreachable buyer, bad address, and overall RTO. `choose_action` evaluates all six economic actions in integer paise and supports deterministic merchant holdouts. Fake messaging/payment providers are safe defaults; `RazorpayPaymentLinkProvider` is test-mode only and reads credentials from the environment. Live WhatsApp execution remains Stage 2.
 
 ## Run
 

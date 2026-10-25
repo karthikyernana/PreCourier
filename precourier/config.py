@@ -94,6 +94,10 @@ class MerchantConfig:
     mode: Mode = Mode.SHADOW
     max_hold_minutes: int = 240                # hard auto-release; fulfilment is sacred
     reply_window_hours: int = 4
+    #: What happens when a gateway payment offer is not paid before its hold
+    #: deadline. ``ship_cod`` preserves fulfilment; ``cancel`` is for merchants
+    #: who do not want an unpaid offer to enter the carrier network.
+    payment_fallback: str = "ship_cod"
     decision_latency_budget_ms: int = 5000     # p95 target with no buyer contact
 
     # ---- guardrails (PRD section 5) --------------------------------------
@@ -102,6 +106,10 @@ class MerchantConfig:
     tz_offset_minutes: int = 330               # Asia/Kolkata, +05:30, no DST
     max_paid_actions_per_order: int = 1        # prevents message stacking
     max_messages_per_buyer_24h: int = 1        # frequency cap
+
+    # ---- evaluation -------------------------------------------------------
+    #: Deterministic control-group share for measuring the counterfactual.
+    holdout_rate_percent: int = 10
 
     #: Where this merchant's buyers are contacted, and therefore which consent
     #: flag is checked before any message goes out.
@@ -171,10 +179,18 @@ class MerchantConfig:
         if self.max_hold_minutes <= 0:
             raise ConfigError("max_hold_minutes must be positive; fulfilment must "
                               "always be released eventually")
+        if self.payment_fallback not in ("ship_cod", "cancel"):
+            raise ConfigError(
+                "payment_fallback must be ship_cod or cancel, got %r"
+                % self.payment_fallback)
         if not 0 <= self.quiet_hours_start <= 23 or not 0 <= self.quiet_hours_end <= 23:
             raise ConfigError("quiet hours must be hours of a day")
         if self.max_paid_actions_per_order < 1:
             raise ConfigError("max_paid_actions_per_order must be at least 1")
+        if not 0 <= self.holdout_rate_percent <= 100:
+            raise ConfigError(
+                "holdout_rate_percent must be within 0..100, got %d"
+                % self.holdout_rate_percent)
         return self
 
     def replace(self, **changes: object) -> "MerchantConfig":
